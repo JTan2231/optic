@@ -1,29 +1,46 @@
 # Optic
 
-A macOS menu bar app that saves recent screen video with a shortcut. Rust owns
-the recording state, bounded replay buffer, and save jobs. A Swift bridge calls
-AppKit, ScreenCaptureKit, VideoToolbox, and AVFoundation. There are no external
-Rust dependencies.
+A macOS menu bar and Windows tray app that saves recent screen video with a
+shortcut. Rust owns the recording state, bounded replay buffer, and save jobs.
+Native bridges use Apple's screen/media frameworks on macOS and the Windows
+SDK on Windows. There are no external Rust dependencies.
 
 ## Run
 
-Requires macOS 13 or newer, Rust, and Xcode Command Line Tools.
+On macOS, requires macOS 13 or newer, Rust, and Xcode Command Line Tools.
 
 ```sh
 ./scripts/build-app.sh
 open dist/Optic.app
 ```
 
-Optic appears as a recording circle in the menu bar and starts **stopped**.
+On Windows, requires Windows 10/11 x64, Rust's `x86_64-pc-windows-msvc`
+toolchain, PowerShell 7, and Visual Studio 2022's C++ Build Tools with a
+Windows 10/11 SDK. The packaged executable includes its C++ runtime and needs
+no separately installed encoder or command-line tools.
+
+```powershell
+pwsh -File ./scripts/build-app.ps1
+& ./dist/Optic.exe
+```
+
+Build tools are only required to build from source. Ordinary Windows launch
+shows the tray icon without opening a console or taskbar window. Click the
+icon to open its menu. Command-line `--help`, `-h`, and `--self-test [path.mp4]`
+work on both platforms; Windows CLI output also supports redirection.
+
+Optic appears as a recording circle in the menu bar or tray and starts **stopped**.
 The menu provides the same actions as the global shortcuts:
 
-| Shortcut | Action |
-| --- | --- |
-| Control–Option–B | Start buffering; press again to stop and immediately clear history |
-| Control–Option–S | Save the recent buffer as an MP4 while buffering continues |
+| macOS shortcut | Windows shortcut | Action |
+| --- | --- | --- |
+| Control–Option–B | Ctrl+Alt+B | Start buffering; press again to stop and immediately clear history |
+| Control–Option–S | Ctrl+Alt+S | Save the recent buffer as an MP4 while buffering continues |
 
-Clips go to `~/Movies/Optic`. Use **Open Recordings Folder** in the menu to find
-them. Saving is disabled when buffering is stopped. If you save shortly after
+Clips go to `~/Movies/Optic` on macOS, and to `Optic` inside your Videos known
+folder on Windows (normally `%USERPROFILE%\Videos\Optic`; redirected folders
+are respected). Use **Open Recordings Folder** in the menu to find them.
+Saving is disabled when buffering is stopped. If you save shortly after
 starting, the clip contains the history available so far. Stopping does not
 cancel a save that you already requested, and starting again creates fresh
 history.
@@ -64,12 +81,20 @@ pwsh -File ./scripts/ci.ps1
 pwsh -File ./scripts/ci.ps1 -CheckOnly
 # Require full macOS app coverage in CI:
 pwsh -File ./scripts/ci.ps1 -RequireMacOS
+# Require full Windows app coverage in CI:
+pwsh -File ./scripts/ci.ps1 -RequireWindows
 ```
 
 Install Rust with the `clippy` and `rustfmt` components. Full app checks also
-require macOS and Xcode 16 or newer with `swift-format`. Windows/Linux runs
-check the portable Rust code and explicitly report the macOS checks as skipped;
-`-RequireMacOS` makes that coverage gap a failure.
+require the native build tools described above. macOS lint checks require
+Xcode 16 or newer with `swift-format`. Windows runs compile the native bridge
+with MSVC `/W4 /WX`, test the real media pipeline, and build the packaged app.
+Native tests cover cursor composition/rotation/scaling, tray menu states and
+deferred quitting, complete MP4 decoding, keyframe trimming, Unicode paths,
+and export failure cleanup. The synthetic checks do not capture your screen.
+Each platform explicitly reports the other platform's checks as skipped;
+`-RequireMacOS` or `-RequireWindows` makes the corresponding gap a failure.
+Linux runs only cover the portable replay buffer.
 
 The script enables Clippy `all`, `pedantic`, `nursery`, `cargo`, and selected
 restriction lints for casts, panic/unwrap/expect, unfinished code, debug macros,
@@ -80,7 +105,8 @@ wholesale. Rust compiler compatibility lints, Rustdoc lints, and all warnings
 are errors during validation. On macOS,
 Swift formatting/linting uses strict mode and the compiler checks complete
 concurrency safety with warnings as errors. Rust unit tests run in debug and
-release; the media self-test and plist validation also run on macOS.
+release; the media self-test runs on both supported platforms, and plist
+validation also runs on macOS.
 
 Every step is logged under `target/ci/<timestamp>/`, with a `summary.json` of
 exit codes. Checks continue after failures, and any failed fixer or validation
@@ -94,13 +120,19 @@ cargo run -- --self-test target/optic-self-test.mp4
 
 The unit tests check buffer timing, keyframe boundaries, memory bounds, and
 sample release. The media self-test creates synthetic moving frames, encodes
-them through VideoToolbox, trims them through the Rust replay buffer, and
-writes an MP4 through AVFoundation. It does not capture your screen or require
-Screen Recording permission.
+them through the platform H.264 encoder, trims them through the Rust replay
+buffer, and writes a finalized MP4 without re-encoding. It does not capture
+your screen or require Screen Recording permission.
 
 For actual capture, start buffering, wait a few seconds, save, and open the
 result. Stop, start again, and save shortly afterward to confirm the old
 history was cleared.
+
+Windows CI also builds an opt-in `native-tests/capture-live.exe` beside its
+logs. Run it with an output directory on an interactive desktop to check live
+capture, saving while buffering, retained snapshots after stopping, restart,
+interruption, and rapid cancellation. It records the primary display; CI's
+default synthetic tests do not invoke it.
 
 ## Source
 
@@ -108,12 +140,21 @@ history was cleared.
 - `src/buffer.rs`: bounded compressed history and independent save snapshots.
 - `native/Media.swift`: capture, encoding, and finalized MP4 export.
 - `native/App.swift`: menu bar and global shortcuts.
+- `native/windows/App.cpp`: tray menu, global shortcuts, and Videos folder lookup.
+- `native/windows/Capture.cpp`: Desktop Duplication, cursor composition, and capture lifecycle.
+- `native/windows/Media.cpp`: Media Foundation H.264 encoding and MP4 export.
 - `build.rs`: compiles and links the native bridge into the Rust executable.
 
 Use the bundled app for ordinary use so macOS sees its stable bundle identifier.
 The build script applies a local ad-hoc signature; rebuilding or moving the app
 may require refreshing its recording authorization. Distributing it to other
 people would require Developer ID signing and notarization.
+
+Windows builds target x64. The Windows bridge uses Desktop Duplication to
+capture the primary display directly, with no capture picker. Locking,
+suspending, or changing displays interrupts capture and clears history;
+choose Start Buffering again when the display is available. Windows N editions
+need Microsoft's Media Feature Pack for Media Foundation support.
 
 ## License
 

@@ -108,7 +108,7 @@ fn toggle() {
             publish(Phase::Starting, "Starting screen capture…");
             drop(state);
             // SAFETY: Both callbacks have the bridge's C ABI and static
-            // lifetime; they accept ownership of retained samples from Swift.
+            // lifetime; they accept ownership of retained native samples.
             unsafe { native::optic_capture_start(generation, frame_received, capture_event) };
         }
         Phase::Starting | Phase::Buffering => {
@@ -192,8 +192,7 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
 }
 
 fn recording_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("Could not locate your home folder")?;
-    let folder = PathBuf::from(home).join("Movies/Optic");
+    let folder = native::recordings_folder()?;
     std::fs::create_dir_all(&folder)
         .map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
     let now = SystemTime::now()
@@ -211,32 +210,8 @@ fn export(frames: &[Frame<Arc<Sample>>], path: &Path) -> Result<(), String> {
         return Err("No decodable video buffered yet".into());
     }
     let samples: Vec<*mut c_void> = frames.iter().map(|f| f.sample.0).collect();
-    let path =
-        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "Invalid output path")?;
-    let mut error = [0; 2048];
-    // SAFETY: Each sample is retained by frames for this synchronous call;
-    // path is NUL-terminated, and error is writable for the supplied capacity.
-    let success = unsafe {
-        native::optic_export(
-            samples.as_ptr(),
-            samples.len(),
-            path.as_ptr(),
-            error.as_mut_ptr(),
-            error.len(),
-        )
-    };
-    if success {
-        Ok(())
-    } else {
-        // SAFETY: The bridge always terminates its error within the nonempty
-        // output buffer, which remains alive while this string is borrowed.
-        let detail = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
-        Err(if detail.is_empty() {
-            "Video export failed".into()
-        } else {
-            detail.into_owned()
-        })
-    }
+    // SAFETY: The snapshot retains every sample throughout this synchronous call.
+    unsafe { native::export_samples(&samples, path) }
 }
 
 fn save() {
@@ -361,7 +336,19 @@ fn self_test(path: &Path) -> Result<(), String> {
 
 pub fn run() {
     let mut args = std::env::args_os().skip(1);
-    match args.next().as_deref().and_then(|s| s.to_str()) {
+    let first = args.next();
+    #[cfg(target_os = "windows")]
+    if first.is_some() {
+        native::prepare_console();
+    }
+    if first
+        .as_ref()
+        .is_some_and(|argument| argument.to_str().is_none())
+    {
+        eprintln!("Unknown argument. Use --help for options.");
+        std::process::exit(2);
+    }
+    match first.as_deref().and_then(|s| s.to_str()) {
         Some("--self-test") => {
             let path = args.next().map_or_else(
                 || std::env::temp_dir().join("optic-self-test.mp4"),
@@ -372,9 +359,23 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
-        Some("--help" | "-h") => println!(
-            "Optic — macOS screen replay\n\nControl–Option–B: start/stop buffering (stop clears history)\nControl–Option–S: save recent video to ~/Movies/Optic\n\n--self-test [path.mp4]  Verify encoding, buffering, and export without capturing your screen"
-        ),
+        Some("--help" | "-h") => {
+            #[cfg(target_os = "macos")]
+            let (platform, toggle, save, folder) = (
+                "macOS",
+                "Control–Option–B",
+                "Control–Option–S",
+                "~/Movies/Optic",
+            );
+            #[cfg(target_os = "windows")]
+            let (platform, toggle, save, folder) = (
+                "Windows",
+                "Ctrl+Alt+B",
+                "Ctrl+Alt+S",
+                "your Videos folder/Optic",
+            );
+            println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video to {folder}\n\n--self-test [path.mp4]  Verify encoding, buffering, and export without capturing your screen");
+        }
         Some(_) => {
             eprintln!("Unknown argument. Use --help for options.");
             std::process::exit(2);

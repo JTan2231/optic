@@ -10,6 +10,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/Media.swift");
     let target_os = env::var("CARGO_CFG_TARGET_OS")
         .map_err(|error| format!("Could not read the Cargo target OS: {error}"))?;
+    if target_os == "windows" {
+        return build_windows();
+    }
     if target_os != "macos" {
         return Ok(());
     }
@@ -78,6 +81,277 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     println!("cargo:rustc-link-arg=-mmacosx-version-min=13.0");
     Ok(())
+}
+
+fn build_windows() -> Result<(), Box<dyn Error>> {
+    if env::var("CARGO_CFG_TARGET_ARCH")? != "x86_64" || env::var("CARGO_CFG_TARGET_ENV")? != "msvc"
+    {
+        return Err("Windows builds require the x86_64-pc-windows-msvc Rust target".into());
+    }
+    let sources = ["App.cpp", "Capture.cpp", "Media.cpp"];
+    for file in [
+        "Bridge.h",
+        "Media.h",
+        "Optic.rc",
+        "Optic.manifest",
+        "Optic.ico",
+    ] {
+        println!("cargo:rerun-if-changed=native/windows/{file}");
+    }
+    for file in sources {
+        println!("cargo:rerun-if-changed=native/windows/{file}");
+    }
+    println!("cargo:rerun-if-env-changed=OPTIC_VCVARSALL");
+    println!("cargo:rerun-if-env-changed=OPTIC_NATIVE_TESTS_DIR");
+    let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("Cargo did not set OUT_DIR")?);
+    let environment = windows_environment(&out)?;
+    let compiler = windows_tool("cl.exe", &environment)?;
+    let static_crt = env::var("CARGO_CFG_TARGET_FEATURE")?
+        .split(',')
+        .any(|flag| flag == "crt-static");
+    let mut objects = Vec::new();
+    for file in sources {
+        let source = PathBuf::from("native/windows").join(file);
+        let object = out.join(file).with_extension("obj");
+        let mut command = Command::new(&compiler);
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
+        command.args([
+            "/nologo",
+            "/c",
+            "/std:c++17",
+            "/EHsc",
+            "/permissive-",
+            "/W4",
+            "/WX",
+            "/O2",
+            "/utf-8",
+            "/DUNICODE",
+            "/D_UNICODE",
+            "/DWIN32_LEAN_AND_MEAN",
+            "/DNOMINMAX",
+            "/D_WIN32_WINNT=0x0A00",
+            if static_crt { "/MT" } else { "/MD" },
+        ]);
+        command.arg(&source).arg(format!("/Fo{}", object.display()));
+        run_native(&mut command, "compile the Windows native bridge")?;
+        objects.push(object);
+    }
+    let mut librarian = Command::new(windows_tool("lib.exe", &environment)?);
+    librarian.envs(environment.iter().map(|(name, value)| (name, value)));
+    librarian
+        .arg("/nologo")
+        .arg(format!("/OUT:{}", out.join("optic_native.lib").display()))
+        .args(&objects);
+    run_native(&mut librarian, "archive the Windows native bridge")?;
+    let resource = out.join("Optic.res");
+    let mut resources = Command::new(windows_tool("rc.exe", &environment)?);
+    resources.envs(environment.iter().map(|(name, value)| (name, value)));
+    resources
+        .args(["/nologo", "/I", "native/windows", "/fo"])
+        .arg(&resource)
+        .arg("native/windows/Optic.rc");
+    run_native(&mut resources, "compile Windows application resources")?;
+    if let Some(directory) = env::var_os("OPTIC_NATIVE_TESTS_DIR") {
+        build_windows_tests(
+            &compiler,
+            &environment,
+            &out,
+            &PathBuf::from(directory),
+            static_crt,
+        )?;
+    }
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=optic_native");
+    for library in [
+        "user32",
+        "gdi32",
+        "shell32",
+        "ole32",
+        "oleaut32",
+        "uuid",
+        "wtsapi32",
+        "advapi32",
+        "d3d11",
+        "dxgi",
+        "mfplat",
+        "mfreadwrite",
+        "mfuuid",
+        "propsys",
+        "strmiids",
+    ] {
+        println!("cargo:rustc-link-lib={library}");
+    }
+    println!("cargo:rustc-link-arg-bin=optic={}", resource.display());
+    Ok(())
+}
+
+fn build_windows_tests(
+    compiler: &Path,
+    environment: &[(String, String)],
+    out: &Path,
+    directory: &Path,
+    static_crt: bool,
+) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(directory)?;
+    for (source, binary, define) in [
+        (
+            "Capture.cpp",
+            "capture-pixels.exe",
+            "/DOPTIC_CAPTURE_PIXEL_TEST",
+        ),
+        ("AppTest.cpp", "tray.exe", "/DOPTIC_UI_TEST"),
+        ("MediaTest.cpp", "media.exe", "/DOPTIC_MEDIA_TEST"),
+        (
+            "CaptureTest.cpp",
+            "capture-live.exe",
+            "/DOPTIC_CAPTURE_TEST",
+        ),
+    ] {
+        println!("cargo:rerun-if-changed=native/windows/{source}");
+        let mut command = Command::new(compiler);
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
+        command.args([
+            "/nologo",
+            "/std:c++17",
+            "/EHsc",
+            "/permissive-",
+            "/W4",
+            "/WX",
+            "/O2",
+            "/utf-8",
+            "/DUNICODE",
+            "/D_UNICODE",
+            "/DWIN32_LEAN_AND_MEAN",
+            "/DNOMINMAX",
+            "/D_WIN32_WINNT=0x0A00",
+            define,
+            if static_crt { "/MT" } else { "/MD" },
+        ]);
+        command
+            .arg(PathBuf::from("native/windows").join(source))
+            .arg(format!("/Fe{}", directory.join(binary).display()))
+            .arg(format!(
+                "/Fo{}",
+                out.join(binary).with_extension("obj").display()
+            ));
+        if source == "MediaTest.cpp" || source == "CaptureTest.cpp" {
+            command.arg(out.join("optic_native.lib"));
+        }
+        command.arg("/link").args([
+            "user32.lib",
+            "gdi32.lib",
+            "shell32.lib",
+            "ole32.lib",
+            "oleaut32.lib",
+            "uuid.lib",
+            "wtsapi32.lib",
+            "advapi32.lib",
+            "mfplat.lib",
+            "mfreadwrite.lib",
+            "mfuuid.lib",
+            "strmiids.lib",
+            "d3d11.lib",
+            "dxgi.lib",
+        ]);
+        command.arg(out.join("Optic.res"));
+        if source == "AppTest.cpp" {
+            command.args(["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]);
+        }
+        run_native(&mut command, "build Windows native integration tests")?;
+    }
+    Ok(())
+}
+
+fn run_native(command: &mut Command, purpose: &str) -> Result<(), Box<dyn Error>> {
+    let status = command
+        .status()
+        .map_err(|error| format!("Could not {purpose}: {error}"))?;
+    if !status.success() {
+        return Err(format!("Could not {purpose}: {status}").into());
+    }
+    Ok(())
+}
+
+fn windows_environment(out: &Path) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let vcvars = if let Some(path) = env::var_os("OPTIC_VCVARSALL") {
+        PathBuf::from(path)
+    } else {
+        let program_files =
+            env::var_os("ProgramFiles(x86)").ok_or("Could not locate Visual Studio Installer")?;
+        let vswhere =
+            PathBuf::from(program_files).join("Microsoft Visual Studio/Installer/vswhere.exe");
+        let output = Command::new(vswhere)
+            .args([
+                "-all",
+                "-latest",
+                "-products",
+                "*",
+                "-property",
+                "installationPath",
+            ])
+            .output()
+            .map_err(|error| {
+                format!("Install Visual Studio 2022 C++ Build Tools and the Windows SDK: {error}")
+            })?;
+        let installation = String::from_utf8(output.stdout)?;
+        let installation = installation.trim();
+        if !output.status.success() || installation.is_empty() {
+            return Err("Install Visual Studio 2022 C++ Build Tools and the Windows SDK".into());
+        }
+        PathBuf::from(installation).join("VC/Auxiliary/Build/vcvarsall.bat")
+    };
+    if !vcvars.is_file() {
+        return Err(format!("Could not locate {}", vcvars.display()).into());
+    }
+    let script = out.join("optic-toolchain.cmd");
+    // The generated batch file only reads toolchain environment. Reject shell
+    // metacharacters in the override before interpolating its quoted path.
+    let vcvars = vcvars
+        .to_str()
+        .ok_or("Invalid Visual Studio toolchain path")?;
+    if vcvars.contains(['"', '%', '\r', '\n']) {
+        return Err("Invalid Visual Studio toolchain path".into());
+    }
+    std::fs::write(
+        &script,
+        format!("@echo off\r\nchcp 65001 >nul\r\ncall \"{vcvars}\" x64 >nul\r\nif errorlevel 1 exit /b 1\r\nset\r\n"),
+    )?;
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c"])
+        .arg(&script)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not initialize MSVC: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let environment = String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            if name.is_empty() {
+                None
+            } else {
+                Some((name.to_owned(), value.to_owned()))
+            }
+        })
+        .collect();
+    Ok(environment)
+}
+
+fn windows_tool(name: &str, environment: &[(String, String)]) -> Result<PathBuf, Box<dyn Error>> {
+    let path = environment
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .ok_or("MSVC did not set PATH")?;
+    env::split_paths(&path.1)
+        .map(|folder| folder.join(name))
+        .find(|tool| tool.is_file())
+        .ok_or_else(|| {
+            format!("Could not locate {name}; install the C++ Build Tools and Windows SDK").into()
+        })
 }
 
 fn xcrun_stdout(arguments: &[&str], purpose: &str) -> Result<String, Box<dyn Error>> {

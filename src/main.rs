@@ -1,22 +1,24 @@
-//! Optic records a bounded history of screen video on macOS 13 or newer.
+//! Optic records a bounded history of screen video on macOS and Windows.
 //!
 //! The Rust replay buffer owns compressed samples and save snapshots; the
-//! Swift bridge provides the menu bar interface, capture, encoding, and export.
+//! native bridges provide the tray interface, capture, encoding, and export.
 
-#[cfg(any(target_os = "macos", test))]
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod buffer;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
 
 fn main() {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     app::run();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        eprintln!("Optic currently supports macOS 13 or newer.");
+        eprintln!("Optic supports macOS 13 or newer and Windows 10/11 x64.");
         std::process::exit(1);
     }
 }
