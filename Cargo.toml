@@ -1,0 +1,11 @@
+[package]
+name = "optic"
+version = "0.1.0"
+edition = "2021"
+description = "A macOS menu bar instant replay recorder"
+build = "build.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+
