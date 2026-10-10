@@ -3,6 +3,11 @@ name = "optic"
 version = "0.1.0"
 edition = "2021"
 description = "A macOS menu bar instant replay recorder"
+license = "MIT"
+repository = "https://github.com/jtan2231/optic"
+readme = "README.md"
+keywords = ["macos", "screen-recording", "instant-replay", "video"]
+categories = ["multimedia::video"]
 build = "build.rs"
 
 [profile.release]

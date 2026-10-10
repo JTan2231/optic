@@ -55,6 +55,38 @@ menu actions still work.
 
 ## Verify
 
+Run the PowerShell 7 CI script to apply supported Rust/Swift fixes and then
+validate the result:
+
+```powershell
+pwsh -File ./scripts/ci.ps1
+# Validate without editing source:
+pwsh -File ./scripts/ci.ps1 -CheckOnly
+# Require full macOS app coverage in CI:
+pwsh -File ./scripts/ci.ps1 -RequireMacOS
+```
+
+Install Rust with the `clippy` and `rustfmt` components. Full app checks also
+require macOS and Xcode 16 or newer with `swift-format`. Windows/Linux runs
+check the portable Rust code and explicitly report the macOS checks as skipped;
+`-RequireMacOS` makes that coverage gap a failure.
+
+The script enables Clippy `all`, `pedantic`, `nursery`, `cargo`, and selected
+restriction lints for casts, panic/unwrap/expect, unfinished code, debug macros,
+and undocumented unsafe code. Following the
+[Clippy guidance](https://doc.rust-lang.org/clippy/usage.html#clippyrestriction),
+the complete restriction group contains conflicting rules, so it is not enabled
+wholesale. Rust compiler compatibility lints, Rustdoc lints, and all warnings
+are errors during validation. On macOS,
+Swift formatting/linting uses strict mode and the compiler checks complete
+concurrency safety with warnings as errors. Rust unit tests run in debug and
+release; the media self-test and plist validation also run on macOS.
+
+Every step is logged under `target/ci/<timestamp>/`, with a `summary.json` of
+exit codes. Checks continue after failures, and any failed fixer or validation
+step produces exit code 1. Automatically applied fixes stay in the working tree
+for review; remaining diagnostics need manual changes.
+
 ```sh
 cargo test
 cargo run -- --self-test target/optic-self-test.mp4
@@ -82,3 +114,7 @@ Use the bundled app for ordinary use so macOS sees its stable bundle identifier.
 The build script applies a local ad-hoc signature; rebuilding or moving the app
 may require refreshing its recording authorization. Distributing it to other
 people would require Developer ID signing and notarization.
+
+## License
+
+Optic is available under the [MIT license](LICENSE).

@@ -23,7 +23,7 @@ pub struct ReplayBuffer<T> {
 }
 
 impl<T> ReplayBuffer<T> {
-    pub fn new(max_seconds: f64, max_bytes: usize) -> Self {
+    pub const fn new(max_seconds: f64, max_bytes: usize) -> Self {
         Self {
             frames: VecDeque::new(),
             bytes: 0,
@@ -101,7 +101,7 @@ impl<T> ReplayBuffer<T> {
         self.frames.len()
     }
 
-    pub fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 
@@ -115,7 +115,8 @@ impl<T> ReplayBuffer<T> {
 
     fn discard_prefix(&mut self, count: usize) {
         for _ in 0..count {
-            if let Some(frame) = self.frames.pop_front() {
+            let popped = self.frames.pop_front();
+            if let Some(frame) = popped {
                 self.bytes -= frame.size;
             }
         }
@@ -136,7 +137,7 @@ mod tests {
 
     fn frame(pts: f64, keyframe: bool, size: usize) -> Frame<u64> {
         Frame {
-            sample: pts as u64,
+            sample: pts.to_bits(),
             pts,
             duration: 1.0,
             size,
@@ -161,17 +162,17 @@ mod tests {
     fn retains_keyframe_preceding_time_cutoff() {
         let mut buffer = ReplayBuffer::new(5.0, 1000);
         for second in 0..=8 {
-            assert!(buffer.push(frame(second as f64, second % 2 == 0, 10)));
+            assert!(buffer.push(frame(f64::from(second), second % 2 == 0, 10)));
         }
         let snapshot = buffer.snapshot();
-        assert_eq!(snapshot.first().unwrap().pts, 2.0);
-        assert!(snapshot.first().unwrap().keyframe);
+        assert_eq!(snapshot.first().map(|frame| frame.pts), Some(2.0));
+        assert!(snapshot.first().is_some_and(|frame| frame.keyframe));
         assert_eq!(buffer.len(), 7);
         assert_eq!(buffer.bytes(), 70);
         assert_eq!(buffer.duration(), 7.0);
 
         assert!(buffer.push(frame(9.0, false, 10)));
-        assert_eq!(buffer.snapshot().first().unwrap().pts, 4.0);
+        assert_eq!(buffer.snapshot().first().map(|frame| frame.pts), Some(4.0));
         assert_eq!(buffer.bytes(), 60);
     }
 
@@ -213,12 +214,12 @@ mod tests {
         assert_eq!(buffer.len(), 2);
 
         for second in 2..=5 {
-            assert!(buffer.push(frame(second as f64, second % 2 == 0, 10)));
+            assert!(buffer.push(frame(f64::from(second), second % 2 == 0, 10)));
         }
         assert_eq!(buffer.snapshot()[0].pts, 2.0);
         assert_eq!(saved.len(), 2);
-        assert_eq!(saved[0].sample, 0);
-        assert_eq!(saved[1].sample, 1);
+        assert_eq!(saved[0].sample, 0.0_f64.to_bits());
+        assert_eq!(saved[1].sample, 1.0_f64.to_bits());
         buffer.clear();
         assert_eq!(buffer.len(), 0);
         assert_eq!(buffer.bytes(), 0);
@@ -241,7 +242,7 @@ mod tests {
         for second in 0..3 {
             assert!(buffer.push(Frame {
                 sample: DropProbe(drops.clone()),
-                pts: second as f64,
+                pts: f64::from(second),
                 duration: 1.0,
                 size: 10,
                 keyframe: true,

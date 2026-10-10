@@ -5,7 +5,7 @@ use crate::{
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +20,17 @@ enum Phase {
     Stopping = 3,
 }
 
+impl Phase {
+    const fn native_state(self) -> i32 {
+        match self {
+            Self::Stopped => 0,
+            Self::Starting => 1,
+            Self::Buffering => 2,
+            Self::Stopping => 3,
+        }
+    }
+}
+
 struct Recorder {
     phase: Phase,
     generation: u64,
@@ -29,7 +40,7 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             phase: Phase::Stopped,
             generation: 0,
@@ -46,15 +57,19 @@ fn recorder() -> MutexGuard<'static, Recorder> {
     RECORDER
         .get_or_init(|| Mutex::new(Recorder::new()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 fn publish(phase: Phase, message: &str) {
     // Call with the recorder mutex held: enqueueing native UI updates in state
     // transition order prevents a delayed callback from restoring an old state.
     eprintln!("Optic: {message}");
-    let message = CString::new(message.replace('\0', " ")).unwrap();
-    unsafe { native::optic_set_status(phase as i32, message.as_ptr()) };
+    let Ok(message) = CString::new(message.replace('\0', " ")) else {
+        return;
+    };
+    // SAFETY: The bridge copies the NUL-terminated message before returning;
+    // the CString remains alive throughout the call, and the state is valid.
+    unsafe { native::optic_set_status(phase.native_state(), message.as_ptr()) };
 }
 
 extern "C" fn action(action: i32) -> bool {
@@ -69,6 +84,8 @@ extern "C" fn action(action: i32) -> bool {
             state.phase = Phase::Stopped;
             let finish_now = !state.saving;
             drop(state);
+            // SAFETY: The bridge accepts any generation and enqueues shutdown
+            // on its capture queue without retaining Rust references.
             unsafe { native::optic_capture_stop(generation) };
             return finish_now;
         }
@@ -90,6 +107,8 @@ fn toggle() {
             let generation = state.generation;
             publish(Phase::Starting, "Starting screen capture…");
             drop(state);
+            // SAFETY: Both callbacks have the bridge's C ABI and static
+            // lifetime; they accept ownership of retained samples from Swift.
             unsafe { native::optic_capture_start(generation, frame_received, capture_event) };
         }
         Phase::Starting | Phase::Buffering => {
@@ -99,6 +118,8 @@ fn toggle() {
             let generation = state.generation;
             publish(Phase::Stopping, "Stopping · buffer cleared");
             drop(state);
+            // SAFETY: The bridge accepts any generation and enqueues shutdown
+            // on its capture queue without retaining Rust references.
             unsafe { native::optic_capture_stop(generation) };
         }
         Phase::Stopping => (),
@@ -137,6 +158,8 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
     let message = if message.is_null() {
         String::new()
     } else {
+        // SAFETY: The bridge provides a NUL-terminated message that stays
+        // valid until this callback returns; the owned copy outlives the call.
         unsafe { CStr::from_ptr(message) }
             .to_string_lossy()
             .into_owned()
@@ -165,6 +188,7 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
     if let Some((phase, message)) = output {
         publish(phase, &message);
     }
+    drop(state);
 }
 
 fn recording_path() -> Result<PathBuf, String> {
@@ -187,9 +211,11 @@ fn export(frames: &[Frame<Arc<Sample>>], path: &Path) -> Result<(), String> {
         return Err("No decodable video buffered yet".into());
     }
     let samples: Vec<*mut c_void> = frames.iter().map(|f| f.sample.0).collect();
-    use std::os::unix::ffi::OsStrExt;
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| "Invalid output path")?;
-    let mut error = vec![0 as c_char; 2048];
+    let path =
+        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "Invalid output path")?;
+    let mut error = [0; 2048];
+    // SAFETY: Each sample is retained by frames for this synchronous call;
+    // path is NUL-terminated, and error is writable for the supplied capacity.
     let success = unsafe {
         native::optic_export(
             samples.as_ptr(),
@@ -202,6 +228,8 @@ fn export(frames: &[Frame<Arc<Sample>>], path: &Path) -> Result<(), String> {
     if success {
         Ok(())
     } else {
+        // SAFETY: The bridge always terminates its error within the nonempty
+        // output buffer, which remains alive while this string is borrowed.
         let detail = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
         Err(if detail.is_empty() {
             "Video export failed".into()
@@ -243,6 +271,8 @@ fn save() {
         let shutdown = state.shutdown;
         if shutdown {
             drop(state);
+            // SAFETY: The bridge enqueues termination on the main run loop;
+            // it takes no pointers and may be called from this worker thread.
             unsafe { native::optic_finish_quit() };
             return;
         }
@@ -266,29 +296,43 @@ extern "C" fn test_frame(
     if sample.is_null() {
         return;
     }
-    TEST_BUFFER.get().unwrap().lock().unwrap().push(Frame {
+    let frame = Frame {
         sample: Arc::new(Sample(sample)),
         pts,
         duration,
         size,
         keyframe,
-    });
+    };
+    if let Some(buffer) = TEST_BUFFER.get() {
+        buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(frame);
+    }
 }
 
-fn self_test(path: PathBuf) -> Result<(), String> {
+fn self_test(path: &Path) -> Result<(), String> {
     TEST_BUFFER
         .set(Mutex::new(ReplayBuffer::new(1.0, BUFFER_BYTES)))
         .map_err(|_| "Self-test already initialized")?;
-    let mut error = vec![0 as c_char; 2048];
+    let mut error = [0; 2048];
+    // SAFETY: The callback has the required C ABI and accepts the transferred
+    // sample references. The nonempty error buffer is writable for its length.
     let success = unsafe {
         native::optic_generate_test_video(1, test_frame, error.as_mut_ptr(), error.len())
     };
     if !success {
+        // SAFETY: The bridge always terminates its error within this nonempty
+        // buffer, and the string is copied before the buffer leaves scope.
         return Err(unsafe { CStr::from_ptr(error.as_ptr()) }
             .to_string_lossy()
             .into_owned());
     }
-    let mut buffer = TEST_BUFFER.get().unwrap().lock().unwrap();
+    let mut buffer = TEST_BUFFER
+        .get()
+        .ok_or("Self-test buffer was not initialized")?
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let frames = buffer.snapshot();
     let duration = buffer.duration();
     let bytes = buffer.bytes();
@@ -301,8 +345,8 @@ fn self_test(path: PathBuf) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    export(&frames, &path)?;
-    let file_size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    export(&frames, path)?;
+    let file_size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if file_size < 1024 {
         return Err("Export produced an unexpectedly small file".into());
     }
@@ -310,6 +354,7 @@ fn self_test(path: PathBuf) -> Result<(), String> {
     if buffer.len() != 0 || buffer.bytes() != 0 {
         return Err("Buffer did not clear".into());
     }
+    drop(buffer);
     println!("Media self-test passed: {} frames, {duration:.3}s, {bytes} buffered bytes, {file_size} file bytes\n{}", frames.len(), path.display());
     Ok(())
 }
@@ -318,9 +363,11 @@ pub fn run() {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(|s| s.to_str()) {
         Some("--self-test") => {
-            let path = args.next().map(PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("optic-self-test.mp4"));
-            if let Err(error) = self_test(path) {
+            let path = args.next().map_or_else(
+                || std::env::temp_dir().join("optic-self-test.mp4"),
+                PathBuf::from,
+            );
+            if let Err(error) = self_test(&path) {
                 eprintln!("Media self-test failed: {error}");
                 std::process::exit(1);
             }
@@ -334,6 +381,8 @@ pub fn run() {
         }
         None => {
             drop(recorder());
+            // SAFETY: This is the executable's main thread, and action has
+            // the required C ABI and remains available for the app's lifetime.
             unsafe { native::optic_run(action) };
         }
     }
