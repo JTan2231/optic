@@ -4,7 +4,7 @@
 Applies supported fixes, then runs strict checks and reports every failure.
 .DESCRIPTION
 Requires Rust with Clippy and rustfmt. Full app coverage requires macOS with
-Xcode 16+, or Windows x64 with C++ Build Tools and a Windows SDK. Logs and a JSON summary are written
+Xcode 16+, or Windows x64 with the MSVC linker and a Windows SDK. Logs and a JSON summary are written
 under target/ci. Fixes remain in the working tree, even when validation fails.
 .PARAMETER CheckOnly
 Runs validation without changing source files.
@@ -34,7 +34,7 @@ $null = New-Item -ItemType Directory -Path $reportDirectory -Force
 $results = [System.Collections.Generic.List[object]]::new()
 $savedEnvironment = @{}
 foreach ($name in @('PATH', 'RUSTFLAGS', 'RUSTDOCFLAGS', 'CARGO_BUILD_WARNINGS',
-        'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'OPTIC_NATIVE_TESTS_DIR')) {
+        'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'OPTIC_VERIFY_CLIP')) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 
@@ -49,7 +49,7 @@ function Get-BaseFlags {
 }
 $baseRustFlags = @(Get-BaseFlags -EncodedName 'CARGO_ENCODED_RUSTFLAGS' -PlainName 'RUSTFLAGS')
 $baseRustdocFlags = @(Get-BaseFlags -EncodedName 'CARGO_ENCODED_RUSTDOCFLAGS' -PlainName 'RUSTDOCFLAGS')
-if ($IsWindows) { $env:OPTIC_NATIVE_TESTS_DIR = Join-Path $reportDirectory 'native-tests' }
+
 
 function Set-CiRustFlags {
     param([string[]] $Flags)
@@ -225,13 +225,11 @@ try {
         if ($cargo) {
             Invoke-CiCommand -Name 'windows-media-self-test' -Phase 'Check' -FilePath $cargo `
                 -Arguments @('run', '--locked', '--all-features', '--', '--self-test', (Join-Path $reportDirectory 'self-test.mp4'))
-            foreach ($test in @('capture-pixels', 'tray', 'media')) {
-                Invoke-CiCommand -Name "windows-native-$test" -Phase 'Check' `
-                    -FilePath (Join-Path $env:OPTIC_NATIVE_TESTS_DIR "$test.exe") -Arguments @()
-            }
-            Invoke-CiCommand -Name 'windows-self-test-decode' -Phase 'Check' `
-                -FilePath (Join-Path $env:OPTIC_NATIVE_TESTS_DIR 'media.exe') `
-                -Arguments @('--verify', (Join-Path $reportDirectory 'self-test.mp4'))
+            # Pixel, tray lifecycle, and media integration coverage now runs in
+            # cargo test above. Decode the executable's replay-buffer export too.
+            $env:OPTIC_VERIFY_CLIP = Join-Path $reportDirectory 'self-test.mp4'
+            Invoke-CiCommand -Name 'windows-self-test-decode' -Phase 'Check' -FilePath $cargo -Arguments @('test', '--locked', '--all-features', 'windows::media::tests::verify_external_clip', '--', '--ignored', '--exact', '--nocapture')
+
             Invoke-CiCommand -Name 'windows-package' -Phase 'Check' -FilePath (Get-Process -Id $PID).Path `
                 -Arguments @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'build-app.ps1'))
             $packagedApp = Join-Path $repositoryRoot 'dist/Optic.exe'
@@ -241,8 +239,9 @@ try {
             $packagedClip = Join-Path $reportDirectory 'packaged-self-test.mp4'
             Invoke-CiCommand -Name 'windows-package-self-test' -Phase 'Check' -FilePath $packagedApp `
                 -Arguments @('--self-test', $packagedClip)
-            Invoke-CiCommand -Name 'windows-package-decode' -Phase 'Check' `
-                -FilePath (Join-Path $env:OPTIC_NATIVE_TESTS_DIR 'media.exe') -Arguments @('--verify', $packagedClip)
+            $env:OPTIC_VERIFY_CLIP = $packagedClip
+            Invoke-CiCommand -Name 'windows-package-decode' -Phase 'Check' -FilePath $cargo -Arguments @('test', '--locked', '--all-features', 'windows::media::tests::verify_external_clip', '--', '--ignored', '--exact', '--nocapture')
+
             $compiler = Get-Command ISCC.exe -CommandType Application -ErrorAction SilentlyContinue
             $compilerCandidates = @(
                 $env:OPTIC_ISCC,
@@ -269,7 +268,7 @@ try {
     else {
         $status = if ($RequireWindows) { 'Failed' } else { 'Skipped' }
         $code = if ($RequireWindows) { 1 } else { 0 }
-        $detail = 'Windows app and media checks require a Windows x64 runner with Visual Studio C++ Build Tools and the Windows SDK.'
+        $detail = 'Windows app and media checks require a Windows x64 runner with the MSVC linker and Windows SDK.'
         Add-CiResult -Name 'windows-app-checks' -Phase 'Coverage' -Status $status -ExitCode $code -Log '' -Detail $detail
         Write-Host "`n$status`: $detail"
         if ($RequireInstaller) {

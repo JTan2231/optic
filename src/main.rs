@@ -1,7 +1,7 @@
 //! Optic records a bounded history of screen video on macOS and Windows.
 //!
 //! The Rust replay buffer owns compressed samples and save snapshots; the
-//! native bridges provide the tray interface, capture, encoding, and export.
+//! Windows services use Rust; macOS capture and UI use a native Swift bridge.
 
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
@@ -14,6 +14,9 @@ mod logging;
 mod app;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "windows"))]

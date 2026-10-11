@@ -12,7 +12,7 @@ $cargoPath = if ($cargo) { $cargo.Source } else {
 if (-not (Test-Path -LiteralPath $cargoPath -PathType Leaf)) { throw 'Install Rust from https://rustup.rs.' }
 $savedPath = $env:PATH
 $savedFlags = $env:CARGO_ENCODED_RUSTFLAGS
-# Bundle the native C++ runtime in the release executable.
+# Statically link the MSVC C runtime in the Rust executable.
 $baseFlags = if ($savedFlags) { @($savedFlags.Split([char]31)) } else {
     @([regex]::Split(($env:RUSTFLAGS + '').Trim(), '\s+') | Where-Object { $_ })
 }

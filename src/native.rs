@@ -1,201 +1,193 @@
+//! Safe platform facade; only macOS retains a foreign-language bridge.
+
+use std::path::Path;
 #[cfg(target_os = "macos")]
-use std::ffi::CString;
+use std::path::PathBuf;
+
 #[cfg(target_os = "windows")]
-use std::{
-    ffi::OsString,
-    os::windows::ffi::{OsStrExt, OsStringExt},
+pub use crate::windows::media::EncodedSample as Sample;
+#[cfg(target_os = "windows")]
+pub use crate::windows::{
+    app::{finish_quit, prepare_console, recordings_folder, run, set_status, shutdown},
+    capture::{start as capture_start, stop as capture_stop},
+    FrameCallback,
 };
-use std::{
-    ffi::{c_char, c_void, CStr},
-    path::{Path, PathBuf},
-};
 
-pub type FrameCallback = extern "C" fn(u64, *mut c_void, f64, f64, usize, bool);
-pub type EventCallback = extern "C" fn(u64, i32, *const c_char);
-type ErrorCallback = extern "C" fn(*const c_char, *const c_char, *const c_char);
+#[cfg(target_os = "windows")]
+pub const fn initialize_error_reporting() {}
 
-unsafe extern "C" {
-    fn optic_set_error_callback(callback: ErrorCallback);
-    pub fn optic_run(callback: extern "C" fn(i32) -> bool);
-    pub fn optic_finish_quit();
-    pub fn optic_set_status(state: i32, message: *const c_char);
-    pub fn optic_capture_start(generation: u64, frame: FrameCallback, event: EventCallback);
-    pub fn optic_capture_stop(generation: u64);
-    pub fn optic_sample_release(sample: *mut c_void);
-    #[cfg(target_os = "macos")]
-    fn optic_export(
-        samples: *const *mut c_void,
-        count: usize,
-        path: *const c_char,
-        error: *mut c_char,
-        error_capacity: usize,
-    ) -> bool;
-    #[cfg(target_os = "windows")]
-    fn optic_export(
-        samples: *const *mut c_void,
-        count: usize,
-        path: *const u16,
-        error: *mut c_char,
-        error_capacity: usize,
-    ) -> bool;
-    #[cfg(target_os = "windows")]
-    fn optic_recordings_folder(
-        path: *mut u16,
-        capacity: usize,
-        error: *mut c_char,
-        error_capacity: usize,
-    ) -> bool;
-    #[cfg(target_os = "windows")]
-    fn optic_prepare_console();
-    #[cfg(target_os = "windows")]
-    fn optic_shutdown(timeout_ms: u32, error: *mut c_char, error_capacity: usize) -> bool;
-    pub fn optic_generate_test_video(
-        generation: u64,
-        frame: FrameCallback,
-        error: *mut c_char,
-        error_capacity: usize,
-    ) -> bool;
-}
-
-/// Registers the process-lifetime diagnostic callback before native work starts.
-pub fn initialize_error_reporting() {
-    // SAFETY: This callback has the native C ABI and static lifetime. Native
-    // code invokes it without holding its UI locks and retains no Rust data.
-    unsafe { optic_set_error_callback(native_error) };
-}
-
-extern "C" fn native_error(component: *const c_char, event: *const c_char, message: *const c_char) {
-    // A logger failure must never unwind through the native C ABI.
-    let _ = std::panic::catch_unwind(|| {
-        let copy = |pointer: *const c_char| {
-            if pointer.is_null() {
-                String::new()
-            } else {
-                // SAFETY: Native code supplies NUL-terminated strings valid
-                // until this callback returns. Copy before retaining anything.
-                unsafe { CStr::from_ptr(pointer) }
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        crate::logging::error(&copy(component), &copy(event), &copy(message), None);
-    });
-}
-
-/// Owns one immutable compressed sample transferred by the native bridge.
-pub struct Sample(pub *mut c_void);
-
-// SAFETY: Compressed sample data is immutable. The bridge permits transferring
-// its owned sample to an export worker and releasing it there. Windows samples
-// own immutable bytes and format metadata rather than mutable COM objects.
-unsafe impl Send for Sample {}
-// SAFETY: Shared references only borrow immutable compressed sample data;
-// the owning Sample keeps its native allocation alive during export.
-unsafe impl Sync for Sample {}
-
-impl Drop for Sample {
-    fn drop(&mut self) {
-        // SAFETY: The bridge transferred exactly one retained sample reference to
-        // this owner, and Drop releases it exactly once on any thread.
-        unsafe { optic_sample_release(self.0) };
-    }
+#[cfg(target_os = "windows")]
+pub fn generate_test_video(generation: u64, callback: FrameCallback) -> Result<(), String> {
+    crate::windows::media::generate_test_video(generation, std::sync::Arc::new(callback))
 }
 
 #[cfg(target_os = "windows")]
-pub fn prepare_console() {
-    // SAFETY: This only attaches the calling process to its parent's console,
-    // preserving redirected output handles. It retains no Rust references.
-    unsafe {
-        optic_prepare_console();
-    };
+pub fn export_samples(samples: &[&Sample], path: &Path) -> Result<(), String> {
+    let samples: Vec<Sample> = samples.iter().map(|sample| (*sample).clone()).collect();
+    crate::windows::media::export_samples(&samples, path)
 }
 
-#[cfg(target_os = "windows")]
-pub fn shutdown(timeout_ms: u32) -> Result<(), String> {
-    let mut error = [0; 2048];
-    // SAFETY: The bridge copies its error into this writable buffer and retains
-    // no references. It asks only this user's session instance to finish saving.
-    if unsafe { optic_shutdown(timeout_ms, error.as_mut_ptr(), error.len()) } {
-        Ok(())
-    } else {
-        Err(bridge_error(&error))
+#[cfg(target_os = "macos")]
+pub use macos::*;
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::{Path, PathBuf};
+    use std::ffi::{c_char, c_void, CStr, CString};
+
+    pub type FrameCallback = extern "C" fn(u64, *mut c_void, f64, f64, usize, bool);
+    pub type EventCallback = extern "C" fn(u64, i32, *const c_char);
+    type ErrorCallback = extern "C" fn(*const c_char, *const c_char, *const c_char);
+
+    unsafe extern "C" {
+        fn optic_set_error_callback(callback: ErrorCallback);
+        fn optic_run(callback: extern "C" fn(i32) -> bool);
+        fn optic_finish_quit();
+        fn optic_set_status(state: i32, message: *const c_char);
+        fn optic_capture_start(generation: u64, frame: FrameCallback, event: EventCallback);
+        fn optic_capture_stop(generation: u64);
+        fn optic_sample_release(sample: *mut c_void);
+        fn optic_export(
+            samples: *const *mut c_void,
+            count: usize,
+            path: *const c_char,
+            error: *mut c_char,
+            error_capacity: usize,
+        ) -> bool;
+        fn optic_generate_test_video(
+            generation: u64,
+            frame: FrameCallback,
+            error: *mut c_char,
+            error_capacity: usize,
+        ) -> bool;
     }
-}
 
-fn bridge_error(error: &[c_char]) -> String {
-    // SAFETY: Every native operation NUL-terminates errors within this buffer.
-    unsafe { CStr::from_ptr(error.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
-}
+    /// Owns the retained immutable CoreMedia sample supplied by Swift.
+    pub struct Sample(*mut c_void);
 
-pub fn recordings_folder() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
-    {
+    impl Sample {
+        /// Takes ownership of the retained CoreMedia sample passed by Swift.
+        ///
+        /// # Safety
+        /// The non-null pointer must own one immutable retained sample reference
+        /// from the Swift bridge, which permits release on any thread.
+        pub const unsafe fn from_retained(pointer: *mut c_void) -> Self {
+            Self(pointer)
+        }
+    }
+    // SAFETY: Swift supplies immutable compressed samples whose retained
+    // references may be transferred to and released on an export worker.
+    unsafe impl Send for Sample {}
+    // SAFETY: Shared references borrow immutable data kept alive by this owner.
+    unsafe impl Sync for Sample {}
+
+    impl Drop for Sample {
+        fn drop(&mut self) {
+            // SAFETY: Exactly one transferred retained reference belongs to us.
+            unsafe { optic_sample_release(self.0) };
+        }
+    }
+
+    pub fn initialize_error_reporting() {
+        // SAFETY: The C ABI callback has process lifetime and copies all strings.
+        unsafe { optic_set_error_callback(native_error) };
+    }
+
+    extern "C" fn native_error(
+        component: *const c_char,
+        event: *const c_char,
+        message: *const c_char,
+    ) {
+        let _ = std::panic::catch_unwind(|| {
+            let copy = |pointer: *const c_char| {
+                if pointer.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: Swift keeps its terminated strings alive for this callback.
+                    unsafe { CStr::from_ptr(pointer) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            crate::logging::error(&copy(component), &copy(event), &copy(message), None);
+        });
+    }
+
+    pub fn run(callback: extern "C" fn(i32) -> bool) {
+        // SAFETY: The caller runs on the main thread; callback has static lifetime.
+        unsafe { optic_run(callback) };
+    }
+
+    pub fn finish_quit() {
+        // SAFETY: Swift queues termination on the main loop and retains no references.
+        unsafe { optic_finish_quit() };
+    }
+
+    pub fn set_status(state: i32, message: &str) {
+        if let Ok(message) = CString::new(message.replace('\0', " ")) {
+            // SAFETY: Swift copies this terminated message synchronously.
+            unsafe { optic_set_status(state, message.as_ptr()) };
+        }
+    }
+
+    pub fn capture_start(generation: u64, frame: FrameCallback, event: EventCallback) {
+        // SAFETY: The C ABI callbacks have static lifetime and accept retained samples.
+        unsafe { optic_capture_start(generation, frame, event) };
+    }
+
+    pub fn capture_stop(generation: u64) {
+        // SAFETY: Swift queues cancellation without borrowing Rust references.
+        unsafe { optic_capture_stop(generation) };
+    }
+
+    pub fn recordings_folder() -> Result<PathBuf, String> {
         let home = std::env::var_os("HOME").ok_or("Could not locate your home folder")?;
         Ok(PathBuf::from(home).join("Movies/Optic"))
     }
-    #[cfg(target_os = "windows")]
-    {
-        let mut path = vec![0; 32_768];
+
+    pub fn export_samples(samples: &[&Sample], path: &Path) -> Result<(), String> {
+        let path =
+            CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "Invalid output path")?;
+        let pointers: Vec<*mut c_void> = samples.iter().map(|sample| sample.0).collect();
         let mut error = [0; 2048];
-        // SAFETY: Both output buffers are writable for their supplied lengths.
-        let success = unsafe {
-            optic_recordings_folder(
-                path.as_mut_ptr(),
-                path.len(),
+        // SAFETY: All owners remain borrowed throughout export; the path is
+        // terminated and the error buffer is writable for its supplied length.
+        if unsafe {
+            optic_export(
+                pointers.as_ptr(),
+                pointers.len(),
+                path.as_ptr(),
                 error.as_mut_ptr(),
                 error.len(),
             )
-        };
-        if !success {
-            return Err(bridge_error(&error));
+        } {
+            Ok(())
+        } else {
+            Err(bridge_error(&error))
         }
-        let length = path
-            .iter()
-            .position(|&unit| unit == 0)
-            .ok_or("Invalid recordings folder")?;
-        Ok(PathBuf::from(OsString::from_wide(&path[..length])))
     }
-}
 
-/// Exports samples borrowed from an independently retained replay snapshot.
-///
-/// # Safety
-/// Every pointer must reference a native sample and remain alive for this call.
-pub unsafe fn export_samples(samples: &[*mut c_void], path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let path =
-        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "Invalid output path")?;
-    #[cfg(target_os = "windows")]
-    let path = {
-        let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if units.contains(&0) {
-            return Err("Invalid output path".into());
+    pub fn generate_test_video(generation: u64, callback: FrameCallback) -> Result<(), String> {
+        let mut error = [0; 2048];
+        // SAFETY: Callback is static and receives retained samples; error is writable.
+        if unsafe {
+            optic_generate_test_video(generation, callback, error.as_mut_ptr(), error.len())
+        } {
+            Ok(())
+        } else {
+            Err(bridge_error(&error))
         }
-        units.push(0);
-        units
-    };
-    let mut error = [0; 2048];
-    // SAFETY: The caller retains all samples; path is NUL-terminated using the
-    // platform's encoding, and the error buffer is writable for its length.
-    let success = unsafe {
-        optic_export(
-            samples.as_ptr(),
-            samples.len(),
-            path.as_ptr(),
-            error.as_mut_ptr(),
-            error.len(),
-        )
-    };
-    if success {
-        Ok(())
-    } else {
-        let detail = bridge_error(&error);
-        Err(if detail.is_empty() {
-            "Video export failed".into()
+    }
+
+    fn bridge_error(error: &[c_char]) -> String {
+        // SAFETY: Every bridge operation terminates its error within this buffer.
+        let detail = unsafe { CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if detail.is_empty() {
+            "Native operation failed".into()
         } else {
             detail
-        })
+        }
     }
 }

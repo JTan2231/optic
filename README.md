@@ -1,9 +1,10 @@
 # Optic
 
 A macOS menu bar and Windows tray app that saves recent screen video with a
-shortcut. Rust owns the recording state, bounded replay buffer, and save jobs.
-Native bridges use Apple's screen/media frameworks on macOS and the Windows
-SDK on Windows. There are no external Rust dependencies.
+shortcut. Rust owns the recording state, bounded replay buffer, save jobs, and
+the complete Windows tray, capture, and media backend. Windows APIs use
+Microsoft's `windows` Rust bindings. A Swift bridge uses Apple's screen/media
+frameworks on macOS.
 
 ## Run
 
@@ -15,8 +16,9 @@ open dist/Optic.app
 ```
 
 On Windows, requires Windows 10/11 x64, Rust's `x86_64-pc-windows-msvc`
-toolchain, PowerShell 7, and Visual Studio 2022's C++ Build Tools with a
-Windows 10/11 SDK. The packaged executable includes its C++ runtime and needs
+toolchain, PowerShell 7, the MSVC linker, and a Windows 10/11 SDK resource
+compiler. Visual Studio 2022's Build Tools provide the linker and SDK; no C++
+source is compiled. The packaged executable includes its C runtime and needs
 no separately installed encoder or command-line tools.
 
 ```powershell
@@ -171,9 +173,9 @@ pwsh -File ./scripts/ci.ps1 -CheckOnly -RequireWindows -RequireInstaller
 
 Install Rust 1.89 or newer with the `clippy` and `rustfmt` components. Full app checks also
 require the native build tools described above. macOS lint checks require
-Xcode 16 or newer with `swift-format`. Windows runs compile the native bridge
-with MSVC `/W4 /WX`, test the real media pipeline, and build the packaged app.
-Native tests cover cursor composition/rotation/scaling, tray menu states and
+Xcode 16 or newer with `swift-format`. Windows runs validate the Rust backend,
+test the real media pipeline, and build the packaged app.
+Rust tests cover cursor composition/rotation/scaling, tray menu states and
 deferred quitting, complete MP4 decoding, keyframe trimming, Unicode paths,
 and export failure cleanup. The synthetic checks do not capture your screen.
 Windows lifecycle tests also cover launches from different paths, maintenance
@@ -226,11 +228,12 @@ For actual capture, start buffering, wait a few seconds, save, and open the
 result. Stop, start again, and save shortly afterward to confirm the old
 history was cleared.
 
-Windows CI also builds an opt-in `native-tests/capture-live.exe` beside its
-logs. Run it with an output directory on an interactive desktop to check live
-capture, saving while buffering, retained snapshots after stopping, restart,
-interruption, and rapid cancellation. It records the primary display; CI's
-default synthetic tests do not invoke it.
+Windows live capture tests are opt-in. On an interactive desktop, set
+`OPTIC_LIVE_CAPTURE_DIR` to an output directory and run
+`cargo test --release windows::capture::tests::live_capture -- --ignored --nocapture`.
+They check capture, saving while buffering, retained snapshots after stopping,
+restart, interruption, and rapid cancellation. They record the primary display;
+CI's default synthetic tests do not invoke them.
 
 ## Source
 
@@ -239,10 +242,12 @@ default synthetic tests do not invoke it.
 - `src/buffer.rs`: bounded compressed history and independent save snapshots.
 - `native/Media.swift`: capture, encoding, and finalized MP4 export.
 - `native/App.swift`: menu bar and global shortcuts.
-- `native/windows/App.cpp`: tray menu, global shortcuts, and Videos folder lookup.
-- `native/windows/Capture.cpp`: Desktop Duplication, cursor composition, and capture lifecycle.
-- `native/windows/Media.cpp`: Media Foundation H.264 encoding and MP4 export.
-- `build.rs`: compiles and links the native bridge into the Rust executable.
+- `src/windows/app.rs`: tray menu, global shortcuts, Videos folder lookup, and maintenance lifecycle.
+- `src/windows/capture.rs`: Desktop Duplication and capture lifecycle.
+- `src/windows/pixels.rs`: cursor composition, rotation, and scaling.
+- `src/windows/media.rs`: Media Foundation H.264 encoding, immutable samples, and MP4 export.
+- `src/native.rs`: safe platform facade and macOS-only foreign-language bridge.
+- `build.rs`: compiles Windows icon/manifest resources or the macOS Swift bridge.
 - `installer/Optic.iss`: per-user Windows install, upgrades, and uninstall.
 - `scripts/build-installer.ps1`: installer build and optional release signing.
 
@@ -251,7 +256,7 @@ The build script applies a local ad-hoc signature; rebuilding or moving the app
 may require refreshing its recording authorization. Distributing it to other
 people would require Developer ID signing and notarization.
 
-Windows builds target x64. The Windows bridge uses Desktop Duplication to
+Windows builds target x64. The Rust Windows backend uses Desktop Duplication to
 capture the primary display directly, with no capture picker. Locking,
 suspending, or changing displays interrupts capture and clears history;
 choose Start Buffering again when the display is available. Windows N editions

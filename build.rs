@@ -88,61 +88,12 @@ fn build_windows() -> Result<(), Box<dyn Error>> {
     {
         return Err("Windows builds require the x86_64-pc-windows-msvc Rust target".into());
     }
-    let sources = ["App.cpp", "Capture.cpp", "Media.cpp"];
-    for file in [
-        "Bridge.h",
-        "Media.h",
-        "Optic.rc",
-        "Optic.manifest",
-        "Optic.ico",
-    ] {
-        println!("cargo:rerun-if-changed=native/windows/{file}");
-    }
-    for file in sources {
+    for file in ["Optic.rc", "Optic.manifest", "Optic.ico"] {
         println!("cargo:rerun-if-changed=native/windows/{file}");
     }
     println!("cargo:rerun-if-env-changed=OPTIC_VCVARSALL");
-    println!("cargo:rerun-if-env-changed=OPTIC_NATIVE_TESTS_DIR");
     let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("Cargo did not set OUT_DIR")?);
     let environment = windows_environment(&out)?;
-    let compiler = windows_tool("cl.exe", &environment)?;
-    let static_crt = env::var("CARGO_CFG_TARGET_FEATURE")?
-        .split(',')
-        .any(|flag| flag == "crt-static");
-    let mut objects = Vec::new();
-    for file in sources {
-        let source = PathBuf::from("native/windows").join(file);
-        let object = out.join(file).with_extension("obj");
-        let mut command = Command::new(&compiler);
-        command.envs(environment.iter().map(|(name, value)| (name, value)));
-        command.args([
-            "/nologo",
-            "/c",
-            "/std:c++17",
-            "/EHsc",
-            "/permissive-",
-            "/W4",
-            "/WX",
-            "/O2",
-            "/utf-8",
-            "/DUNICODE",
-            "/D_UNICODE",
-            "/DWIN32_LEAN_AND_MEAN",
-            "/DNOMINMAX",
-            "/D_WIN32_WINNT=0x0A00",
-            if static_crt { "/MT" } else { "/MD" },
-        ]);
-        command.arg(&source).arg(format!("/Fo{}", object.display()));
-        run_native(&mut command, "compile the Windows native bridge")?;
-        objects.push(object);
-    }
-    let mut librarian = Command::new(windows_tool("lib.exe", &environment)?);
-    librarian.envs(environment.iter().map(|(name, value)| (name, value)));
-    librarian
-        .arg("/nologo")
-        .arg(format!("/OUT:{}", out.join("optic_native.lib").display()))
-        .args(&objects);
-    run_native(&mut librarian, "archive the Windows native bridge")?;
     let resource = out.join("Optic.res");
     let mut resources = Command::new(windows_tool("rc.exe", &environment)?);
     resources.envs(environment.iter().map(|(name, value)| (name, value)));
@@ -151,117 +102,10 @@ fn build_windows() -> Result<(), Box<dyn Error>> {
         .arg(&resource)
         .arg("native/windows/Optic.rc");
     run_native(&mut resources, "compile Windows application resources")?;
-    if let Some(directory) = env::var_os("OPTIC_NATIVE_TESTS_DIR") {
-        build_windows_tests(
-            &compiler,
-            &environment,
-            &out,
-            &PathBuf::from(directory),
-            static_crt,
-        )?;
-    }
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=optic_native");
-    for library in [
-        "user32",
-        "gdi32",
-        "shell32",
-        "ole32",
-        "oleaut32",
-        "uuid",
-        "wtsapi32",
-        "advapi32",
-        "d3d11",
-        "dxgi",
-        "mfplat",
-        "mfreadwrite",
-        "mfuuid",
-        "propsys",
-        "strmiids",
-    ] {
-        println!("cargo:rustc-link-lib={library}");
-    }
-    println!("cargo:rustc-link-arg-bin=optic={}", resource.display());
+    // Include the icon/manifest in both the application and Rust UI test harness.
+    println!("cargo:rustc-link-arg={}", resource.display());
     Ok(())
 }
-
-fn build_windows_tests(
-    compiler: &Path,
-    environment: &[(String, String)],
-    out: &Path,
-    directory: &Path,
-    static_crt: bool,
-) -> Result<(), Box<dyn Error>> {
-    std::fs::create_dir_all(directory)?;
-    for (source, binary, define) in [
-        (
-            "Capture.cpp",
-            "capture-pixels.exe",
-            "/DOPTIC_CAPTURE_PIXEL_TEST",
-        ),
-        ("AppTest.cpp", "tray.exe", "/DOPTIC_UI_TEST"),
-        ("MediaTest.cpp", "media.exe", "/DOPTIC_MEDIA_TEST"),
-        (
-            "CaptureTest.cpp",
-            "capture-live.exe",
-            "/DOPTIC_CAPTURE_TEST",
-        ),
-    ] {
-        println!("cargo:rerun-if-changed=native/windows/{source}");
-        let mut command = Command::new(compiler);
-        command.envs(environment.iter().map(|(name, value)| (name, value)));
-        command.args([
-            "/nologo",
-            "/std:c++17",
-            "/EHsc",
-            "/permissive-",
-            "/W4",
-            "/WX",
-            "/O2",
-            "/utf-8",
-            "/DUNICODE",
-            "/D_UNICODE",
-            "/DWIN32_LEAN_AND_MEAN",
-            "/DNOMINMAX",
-            "/D_WIN32_WINNT=0x0A00",
-            define,
-            if static_crt { "/MT" } else { "/MD" },
-        ]);
-        command
-            .arg(PathBuf::from("native/windows").join(source))
-            .arg(format!("/Fe{}", directory.join(binary).display()))
-            .arg(format!(
-                "/Fo{}",
-                out.join(binary).with_extension("obj").display()
-            ));
-        if source == "MediaTest.cpp" || source == "CaptureTest.cpp" {
-            command.arg(out.join("optic_native.lib"));
-        }
-        command.arg("/link").args([
-            "user32.lib",
-            "gdi32.lib",
-            "shell32.lib",
-            "ole32.lib",
-            "oleaut32.lib",
-            "uuid.lib",
-            "wtsapi32.lib",
-            "advapi32.lib",
-            "mfplat.lib",
-            "mfreadwrite.lib",
-            "mfuuid.lib",
-            "strmiids.lib",
-            "d3d11.lib",
-            "dxgi.lib",
-        ]);
-        command.arg(out.join("Optic.res"));
-        if source == "AppTest.cpp" {
-            command.args(["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]);
-        }
-        run_native(&mut command, "build Windows native integration tests")?;
-    }
-    Ok(())
-}
-
 fn run_native(command: &mut Command, purpose: &str) -> Result<(), Box<dyn Error>> {
     let status = command
         .status()
@@ -291,12 +135,12 @@ fn windows_environment(out: &Path) -> Result<Vec<(String, String)>, Box<dyn Erro
             ])
             .output()
             .map_err(|error| {
-                format!("Install Visual Studio 2022 C++ Build Tools and the Windows SDK: {error}")
+                format!("Install the Visual Studio 2022 MSVC linker and Windows SDK: {error}")
             })?;
         let installation = String::from_utf8(output.stdout)?;
         let installation = installation.trim();
         if !output.status.success() || installation.is_empty() {
-            return Err("Install Visual Studio 2022 C++ Build Tools and the Windows SDK".into());
+            return Err("Install the Visual Studio 2022 MSVC linker and Windows SDK".into());
         }
         PathBuf::from(installation).join("VC/Auxiliary/Build/vcvarsall.bat")
     };
@@ -350,7 +194,7 @@ fn windows_tool(name: &str, environment: &[(String, String)]) -> Result<PathBuf,
         .map(|folder| folder.join(name))
         .find(|tool| tool.is_file())
         .ok_or_else(|| {
-            format!("Could not locate {name}; install the C++ Build Tools and Windows SDK").into()
+            format!("Could not locate {name}; install the MSVC linker and Windows SDK").into()
         })
 }
 

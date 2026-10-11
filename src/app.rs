@@ -3,8 +3,9 @@ use crate::{
     logging,
     native::{self, Sample},
 };
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_void, CStr};
 use std::{
-    ffi::{c_char, c_void, CStr, CString},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
@@ -64,15 +65,10 @@ fn recorder() -> MutexGuard<'static, Recorder> {
 fn publish(phase: Phase, message: &str) {
     // Call with the recorder mutex held: enqueueing native UI updates in state
     // transition order prevents a delayed callback from restoring an old state.
-    let Ok(message) = CString::new(message.replace('\0', " ")) else {
-        return;
-    };
-    // SAFETY: The bridge copies the NUL-terminated message before returning;
-    // the CString remains alive throughout the call, and the state is valid.
-    unsafe { native::optic_set_status(phase.native_state(), message.as_ptr()) };
+    native::set_status(phase.native_state(), message);
 }
 
-extern "C" fn action(action: i32) -> bool {
+fn action(action: i32) -> bool {
     match action {
         1 => toggle(),
         2 => save(),
@@ -84,9 +80,7 @@ extern "C" fn action(action: i32) -> bool {
             state.phase = Phase::Stopped;
             let finish_now = !state.saving;
             drop(state);
-            // SAFETY: The bridge accepts any generation and enqueues shutdown
-            // on its capture queue without retaining Rust references.
-            unsafe { native::optic_capture_stop(generation) };
+            native::capture_stop(generation);
             return finish_now;
         }
         // Windows end-session queries must not initiate irreversible cleanup;
@@ -111,9 +105,7 @@ fn toggle() {
             let generation = state.generation;
             publish(Phase::Starting, "Starting screen capture…");
             drop(state);
-            // SAFETY: Both callbacks have the bridge's C ABI and static
-            // lifetime; they accept ownership of retained native samples.
-            unsafe { native::optic_capture_start(generation, frame_received, capture_event) };
+            native::capture_start(generation, frame_received, capture_event);
         }
         Phase::Starting | Phase::Buffering => {
             // Clear immediately, before asynchronous capture shutdown finishes.
@@ -122,14 +114,13 @@ fn toggle() {
             let generation = state.generation;
             publish(Phase::Stopping, "Stopping · buffer cleared");
             drop(state);
-            // SAFETY: The bridge accepts any generation and enqueues shutdown
-            // on its capture queue without retaining Rust references.
-            unsafe { native::optic_capture_stop(generation) };
+            native::capture_stop(generation);
         }
         Phase::Stopping => (),
     }
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn frame_received(
     generation: u64,
     sample: *mut c_void,
@@ -141,13 +132,40 @@ extern "C" fn frame_received(
     if sample.is_null() {
         return;
     }
+    // SAFETY: Swift transfers one retained immutable sample to this callback.
+    let sample = unsafe { Sample::from_retained(sample) };
     let frame = Frame {
-        sample: Arc::new(Sample(sample)),
+        sample: Arc::new(sample),
         pts,
         duration,
         size,
         keyframe,
     };
+    receive_frame(generation, frame);
+}
+
+#[cfg(target_os = "windows")]
+fn frame_received(generation: u64, sample: Sample) {
+    receive_frame(generation, frame_from_sample(sample));
+}
+
+#[cfg(target_os = "windows")]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "100 ns timestamps fit exact f64 integers for normal capture durations"
+)]
+fn frame_from_sample(sample: Sample) -> Frame<Arc<Sample>> {
+    Frame {
+        pts: sample.pts as f64 / 10_000_000.0,
+        duration: sample.duration as f64 / 10_000_000.0,
+        size: sample.bytes.len(),
+        keyframe: sample.keyframe,
+        sample: Arc::new(sample),
+    }
+}
+
+fn receive_frame(generation: u64, frame: Frame<Arc<Sample>>) {
     let mut state = recorder();
     if !state.shutdown
         && generation == state.generation
@@ -158,6 +176,7 @@ extern "C" fn frame_received(
     // Unaccepted frames release their transferred reference here as well.
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char) {
     let message = if message.is_null() {
         String::new()
@@ -168,6 +187,15 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
             .to_string_lossy()
             .into_owned()
     };
+    handle_capture_event(generation, event, &message);
+}
+
+#[cfg(target_os = "windows")]
+fn capture_event(generation: u64, event: i32, message: &str) {
+    handle_capture_event(generation, event, message);
+}
+
+fn handle_capture_event(generation: u64, event: i32, message: &str) {
     let mut state = recorder();
     if state.shutdown || generation != state.generation {
         return;
@@ -195,7 +223,7 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
         4 => {
             state.phase = Phase::Stopped;
             state.buffer.clear();
-            Some((Phase::Stopped, message.clone()))
+            Some((Phase::Stopped, message.to_owned()))
         }
         _ => None,
     };
@@ -204,7 +232,7 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
     }
     drop(state);
     if event == 3 {
-        logging::error("capture", "capture.failed", &message, Some(generation));
+        logging::error("capture", "capture.failed", message, Some(generation));
     }
 }
 
@@ -226,9 +254,8 @@ fn export(frames: &[Frame<Arc<Sample>>], path: &Path) -> Result<(), String> {
     if frames.is_empty() || !frames[0].keyframe {
         return Err("No decodable video buffered yet".into());
     }
-    let samples: Vec<*mut c_void> = frames.iter().map(|f| f.sample.0).collect();
-    // SAFETY: The snapshot retains every sample throughout this synchronous call.
-    unsafe { native::export_samples(&samples, path) }
+    let samples: Vec<&Sample> = frames.iter().map(|frame| frame.sample.as_ref()).collect();
+    native::export_samples(&samples, path)
 }
 
 fn save() {
@@ -281,9 +308,7 @@ fn finish_save(result: Result<PathBuf, String>, generation: u64) {
     let phase = state.phase;
     if state.shutdown {
         drop(state);
-        // SAFETY: The bridge enqueues termination on the main run loop;
-        // it takes no pointers and may be called from this worker thread.
-        unsafe { native::optic_finish_quit() };
+        native::finish_quit();
         return;
     }
     match result {
@@ -294,6 +319,7 @@ fn finish_save(result: Result<PathBuf, String>, generation: u64) {
 
 static TEST_BUFFER: OnceLock<Mutex<ReplayBuffer<Arc<Sample>>>> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
 extern "C" fn test_frame(
     _generation: u64,
     sample: *mut c_void,
@@ -305,13 +331,24 @@ extern "C" fn test_frame(
     if sample.is_null() {
         return;
     }
+    // SAFETY: The Swift generator transfers one retained immutable sample.
+    let sample = unsafe { Sample::from_retained(sample) };
     let frame = Frame {
-        sample: Arc::new(Sample(sample)),
+        sample: Arc::new(sample),
         pts,
         duration,
         size,
         keyframe,
     };
+    receive_test_frame(frame);
+}
+
+#[cfg(target_os = "windows")]
+fn test_frame(_generation: u64, sample: Sample) {
+    receive_test_frame(frame_from_sample(sample));
+}
+
+fn receive_test_frame(frame: Frame<Arc<Sample>>) {
     if let Some(buffer) = TEST_BUFFER.get() {
         buffer
             .lock()
@@ -324,19 +361,7 @@ fn self_test(path: &Path) -> Result<(), String> {
     TEST_BUFFER
         .set(Mutex::new(ReplayBuffer::new(1.0, BUFFER_BYTES)))
         .map_err(|_| "Self-test already initialized")?;
-    let mut error = [0; 2048];
-    // SAFETY: The callback has the required C ABI and accepts the transferred
-    // sample references. The nonempty error buffer is writable for its length.
-    let success = unsafe {
-        native::optic_generate_test_video(1, test_frame, error.as_mut_ptr(), error.len())
-    };
-    if !success {
-        // SAFETY: The bridge always terminates its error within this nonempty
-        // buffer, and the string is copied before the buffer leaves scope.
-        return Err(unsafe { CStr::from_ptr(error.as_ptr()) }
-            .to_string_lossy()
-            .into_owned());
-    }
+    native::generate_test_video(1, test_frame)?;
     let mut buffer = TEST_BUFFER
         .get()
         .ok_or("Self-test buffer was not initialized")?
@@ -442,11 +467,20 @@ pub fn run() {
         }
         None => {
             drop(recorder());
-            // SAFETY: This is the executable's main thread, and action has
-            // the required C ABI and remains available for the app's lifetime.
-            unsafe { native::optic_run(action) };
+            #[cfg(target_os = "macos")]
+            native::run(macos_action);
+            #[cfg(target_os = "windows")]
+            {
+                native::run(action);
+                crate::windows::capture::shutdown();
+            }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn macos_action(value: i32) -> bool {
+    action(value)
 }
 
 #[cfg(test)]
@@ -508,16 +542,16 @@ mod tests {
     fn capture_errors_log_once_and_ignore_canceled_or_stale_work() -> Result<(), Box<dyn Error>> {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let logs = TestLogs::new();
-        let message = CString::new("Encoder failed (HRESULT 0x80004005)")?;
+        let message = "Encoder failed (HRESULT 0x80004005)";
         logging::with_test_logger(logs.0.clone(), || {
             reset_recorder(Phase::Starting, 7);
-            capture_event(6, 3, message.as_ptr());
+            handle_capture_event(6, 3, message);
             assert_eq!(recorder().phase, Phase::Starting);
-            capture_event(7, 3, message.as_ptr());
+            handle_capture_event(7, 3, message);
             assert_eq!(recorder().phase, Phase::Stopped);
-            capture_event(7, 3, message.as_ptr());
+            handle_capture_event(7, 3, message);
             reset_recorder(Phase::Stopping, 8);
-            capture_event(8, 3, message.as_ptr());
+            handle_capture_event(8, 3, message);
             assert_eq!(recorder().phase, Phase::Stopping);
         });
         let output = logs.contents()?;
@@ -529,21 +563,20 @@ mod tests {
     }
 
     #[test]
-    fn normal_statuses_and_interruptions_create_no_logs() -> Result<(), Box<dyn Error>> {
+    fn normal_statuses_and_interruptions_create_no_logs() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let logs = TestLogs::new();
-        let message = CString::new("Screen capture was interrupted")?;
+        let message = "Screen capture was interrupted";
         logging::with_test_logger(logs.0.clone(), || {
             reset_recorder(Phase::Starting, 9);
-            capture_event(9, 1, std::ptr::null());
+            handle_capture_event(9, 1, "");
             assert_eq!(recorder().phase, Phase::Buffering);
-            capture_event(9, 4, message.as_ptr());
+            handle_capture_event(9, 4, message);
             assert_eq!(recorder().phase, Phase::Stopped);
-            capture_event(9, 2, std::ptr::null());
+            handle_capture_event(9, 2, "");
             finish_save(Ok(PathBuf::from("successful.mp4")), 9);
         });
         assert!(!logs.0.exists());
-        Ok(())
     }
 
     #[test]
