@@ -12,6 +12,7 @@
 #include "Bridge.h"
 
 #include <cmath>
+#include <atomic>
 #include <cwchar>
 #include <exception>
 #include <iterator>
@@ -30,8 +31,10 @@ constexpr wchar_t kWindowClass[] = L"Optic.TrayWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
 constexpr UINT kFinishQuitMessage = WM_APP + 3;
+constexpr UINT kStatusErrorMessage = WM_APP + 5;
 #ifdef OPTIC_UI_TEST
 constexpr UINT kTestInvocationMessage = WM_APP + 4;
+std::atomic<bool> fail_next_status_post{false};
 class Application;
 struct TestInvocation {
     std::function<void(Application&)> action;
@@ -48,6 +51,8 @@ constexpr UINT kTrayId = 1;
 
 std::mutex window_mutex;
 HWND application_window = nullptr;
+std::atomic<ErrorCallback> error_callback{nullptr};
+std::atomic<DWORD> pending_status_error{ERROR_SUCCESS};
 
 struct Status {
     std::int32_t state;
@@ -66,7 +71,7 @@ std::wstring from_utf8(const char* text) {
     return result;
 }
 
-void log(const std::wstring& text) noexcept {
+void write_diagnostic(const std::wstring& text) noexcept {
     try {
         const std::wstring line = L"[optic] " + text + L"\n";
         OutputDebugStringW(line.c_str());
@@ -87,6 +92,53 @@ void log(const std::wstring& text) noexcept {
         }
     } catch (...) {
         OutputDebugStringW(L"[optic] Unable to write diagnostic\n");
+    }
+}
+
+// The bridge supplies borrowed UTF-8 strings; Rust copies them immediately.
+// Call only outside window_mutex and outside optic_set_status, whose caller
+// can hold the Rust recorder lock. Returned media/CLI errors are logged by Rust.
+void report_error(const char* component, const char* event, const std::wstring& text) noexcept {
+    try {
+        if (const auto callback = error_callback.load()) {
+            const int count = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+            if (count == 0 && !text.empty()) { write_diagnostic(text); return; }
+            std::string bytes(static_cast<std::size_t>(count), '\0');
+            if (count && !WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                bytes.data(), count, nullptr, nullptr)) {
+                write_diagnostic(text);
+                return;
+            }
+            callback(component, event, bytes.c_str());
+            return;
+        }
+    } catch (...) {
+        // Neither allocation failures nor a native test callback may unwind
+        // through a Win32 or Rust callback boundary.
+    }
+    write_diagnostic(text);
+}
+
+// Called with window_mutex held, including from a Rust caller that holds its
+// recorder lock. Keep only a bounded, allocation-free pending error and wake
+// the UI; the message loop delivers it after returning from any action callback.
+void queue_status_failure(DWORD error) noexcept {
+    if (!application_window) return;
+    DWORD expected = ERROR_SUCCESS;
+    if (pending_status_error.compare_exchange_strong(expected, error ? error : ERROR_GEN_FAILURE)) {
+        PostMessageW(application_window, kStatusErrorMessage, 0, 0);
+    }
+}
+
+void report_pending_status_failure() noexcept {
+    const DWORD error = pending_status_error.exchange(ERROR_SUCCESS);
+    if (error == ERROR_SUCCESS) return;
+    try {
+        report_error("ui", "tray.status_update_failed",
+            L"Could not post status update (Windows error " + std::to_wstring(error) + L")");
+    } catch (...) {
+        OutputDebugStringW(L"[optic] Could not post status update\n");
     }
 }
 
@@ -150,7 +202,9 @@ HICON make_icon(int size, bool buffering) {
     void* storage = nullptr;
     HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &storage, nullptr, 0);
     if (!bitmap || !storage) {
+        const DWORD error = GetLastError();
         if (bitmap) DeleteObject(bitmap);
+        SetLastError(error);
         return nullptr;
     }
     auto* pixels = static_cast<DWORD*>(storage);
@@ -182,6 +236,7 @@ HICON make_icon(int size, bool buffering) {
     const std::size_t stride = static_cast<std::size_t>((size + 15) / 16 * 2);
     std::vector<unsigned char> mask_data(stride * static_cast<std::size_t>(size), 0);
     HBITMAP mask = CreateBitmap(size, size, 1, 1, mask_data.data());
+    DWORD error = mask ? ERROR_SUCCESS : GetLastError();
     HICON icon = nullptr;
     if (mask) {
         ICONINFO icon_info{};
@@ -189,9 +244,11 @@ HICON make_icon(int size, bool buffering) {
         icon_info.hbmColor = bitmap;
         icon_info.hbmMask = mask;
         icon = CreateIconIndirect(&icon_info);
+        if (!icon) error = GetLastError();
         DeleteObject(mask);
     }
     DeleteObject(bitmap);
+    if (!icon) SetLastError(error);
     return icon;
 }
 
@@ -211,8 +268,11 @@ public:
         window_class.hInstance = instance;
         window_class.lpszClassName = kWindowClass;
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return false;
+        }
         taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
+        if (!taskbar_created_) return false;
         // An ordinary hidden top-level window receives Explorer/display/power
         // broadcasts. A message-only window would miss those notifications.
         window_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"Optic", WS_POPUP,
@@ -223,6 +283,10 @@ public:
             application_window = window_;
         }
         session_notifications_ = WTSRegisterSessionNotification(window_, NOTIFY_FOR_THIS_SESSION) != FALSE;
+        if (!session_notifications_) {
+            report_error("ui", "tray.session_notifications_failed",
+                L"Could not register session notifications (Windows error " + std::to_wstring(GetLastError()) + L")");
+        }
         toggle_hotkey_ = RegisterHotKey(window_, kToggleCommand, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'B') != FALSE;
         if (!toggle_hotkey_) shortcut_failure(L"Ctrl+Alt+B", GetLastError());
         save_hotkey_ = RegisterHotKey(window_, kSaveCommand, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S') != FALSE;
@@ -237,8 +301,12 @@ public:
         while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
+            report_pending_status_failure();
         }
-        if (result == -1) log(L"Windows message loop failed (error " + std::to_wstring(GetLastError()) + L")");
+        const DWORD error = result == -1 ? GetLastError() : ERROR_SUCCESS;
+        report_pending_status_failure();
+        if (result == -1) report_error("ui", "tray.message_loop_failed",
+            L"Windows message loop failed (Windows error " + std::to_wstring(error) + L")");
     }
 
 private:
@@ -253,6 +321,8 @@ private:
     std::wstring message_ = L"Stopped";
     std::vector<std::wstring> shortcut_failures_;
     bool tray_added_ = false;
+    bool icon_failure_reported_ = false;
+    bool tray_failure_reported_ = false;
     bool tray_version_four_ = false;
     bool toggle_hotkey_ = false;
     bool save_hotkey_ = false;
@@ -313,20 +383,36 @@ private:
         refresh_menu();
         HICON replacement = make_icon(tray_icon_size(window_), state_ == 2 && !quitting_);
         if (replacement) {
+            icon_failure_reported_ = false;
             if (icon_) DestroyIcon(icon_);
             icon_ = replacement;
+        } else if (!icon_failure_reported_) {
+            const DWORD error = GetLastError();
+            icon_failure_reported_ = true;
+            report_error("ui", "tray.icon_failed",
+                L"Could not create the tray icon (Windows error " + std::to_wstring(error) + L")");
         }
         auto data = tray_data();
         if (tray_added_) {
-            if (Shell_NotifyIconW(NIM_MODIFY, &data)) return;
+            if (Shell_NotifyIconW(NIM_MODIFY, &data)) {
+                tray_failure_reported_ = false;
+                return;
+            }
             tray_added_ = false;
         }
         if (Shell_NotifyIconW(NIM_ADD, &data)) {
+            tray_failure_reported_ = false;
             tray_added_ = true;
             data.uVersion = NOTIFYICON_VERSION_4;
             tray_version_four_ = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE;
             KillTimer(window_, kTrayRetryTimer);
         } else {
+            const DWORD error = GetLastError();
+            if (!tray_failure_reported_) {
+                tray_failure_reported_ = true;
+                report_error("ui", "tray.registration_failed",
+                    L"Could not add the tray icon (Windows error " + std::to_wstring(error) + L")");
+            }
             SetTimer(window_, kTrayRetryTimer, 2000, nullptr);
         }
     }
@@ -335,7 +421,7 @@ private:
         const std::wstring text = L"Shortcut unavailable: " + std::wstring(shortcut)
             + L" (error " + std::to_wstring(error) + L")";
         shortcut_failures_.insert(shortcut_failures_.begin(), text);
-        log(text);
+        report_error("shortcuts", "shortcut.registration_failed", text);
     }
 
     void set_status(const Status& status) {
@@ -374,14 +460,17 @@ private:
             const auto folder = optic::recordings_folder();
             const int created = SHCreateDirectoryExW(window_, folder.c_str(), nullptr);
             if (created != ERROR_SUCCESS && created != ERROR_ALREADY_EXISTS && created != ERROR_FILE_EXISTS) {
-                log(L"Could not create recordings folder (error " + std::to_wstring(created) + L")");
+                report_error("folders", "recordings_folder.create_failed",
+                    L"Could not create recordings folder (Windows error " + std::to_wstring(created) + L")");
                 return;
             }
             const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(window_, L"open", folder.c_str(),
                 nullptr, nullptr, SW_SHOWNORMAL));
-            if (result <= 32) log(L"Could not open recordings folder: " + folder);
+            if (result <= 32) report_error("folders", "recordings_folder.open_failed",
+                L"Could not open recordings folder (ShellExecute error " + std::to_wstring(result) + L")");
         } catch (const std::exception& error) {
-            log(L"Could not open recordings folder: " + from_utf8(error.what()));
+            report_error("folders", "recordings_folder.open_failed",
+                L"Could not open recordings folder: " + from_utf8(error.what()));
         }
     }
 
@@ -506,6 +595,8 @@ private:
                     if (status) app->set_status(*status);
                     return 0;
                 }
+                case kStatusErrorMessage:
+                    return 0; // The outer message loop reports the pending error.
                 case kFinishQuitMessage:
                     if (app->awaiting_termination_) DestroyWindow(window);
                     return 0;
@@ -571,9 +662,9 @@ private:
                 default: break;
             }
         } catch (const std::exception& error) {
-            log(L"Tray operation failed: " + from_utf8(error.what()));
+            report_error("ui", "tray.operation_failed", L"Tray operation failed: " + from_utf8(error.what()));
         } catch (...) {
-            log(L"Tray operation failed");
+            report_error("ui", "tray.operation_failed", L"Tray operation failed");
         }
         return DefWindowProcW(window, message, wparam, lparam);
     }
@@ -628,33 +719,54 @@ extern "C" void optic_run(ActionCallback callback) {
     if (!callback) return;
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     try {
+        if (FAILED(com)) throw std::runtime_error("Could not initialize the tray COM apartment (HRESULT "
+            + std::to_string(static_cast<unsigned long>(com)) + ")");
         Application application(callback);
         if (application.initialize()) {
             application.run();
         } else {
             const std::wstring message = L"Could not start the Optic tray (error "
                 + std::to_wstring(GetLastError()) + L")";
-            log(message);
+            report_error("ui", "tray.initialization_failed", message);
             MessageBoxW(nullptr, message.c_str(), L"Optic", MB_OK | MB_ICONERROR);
         }
     } catch (const std::exception& error) {
-        log(L"Could not start the Optic tray: " + from_utf8(error.what()));
+        report_error("ui", "tray.initialization_failed", L"Could not start the Optic tray: " + from_utf8(error.what()));
     } catch (...) {
-        log(L"Could not start the Optic tray");
+        report_error("ui", "tray.initialization_failed", L"Could not start the Optic tray");
     }
     if (SUCCEEDED(com)) CoUninitialize();
+}
+
+extern "C" void optic_set_error_callback(ErrorCallback callback) {
+    error_callback.store(callback);
 }
 
 extern "C" void optic_set_status(std::int32_t state, const char* message) {
     try {
         auto status = std::make_unique<Status>(Status{state, from_utf8(message)});
         std::lock_guard<std::mutex> guard(window_mutex);
-        if (application_window && PostMessageW(application_window, kStatusMessage,
-            0, reinterpret_cast<LPARAM>(status.get()))) {
-            status.release();
+        if (application_window) {
+#ifdef OPTIC_UI_TEST
+            const bool synthetic_failure = fail_next_status_post.exchange(false);
+            if (synthetic_failure) SetLastError(ERROR_NOT_ENOUGH_QUOTA);
+#else
+            constexpr bool synthetic_failure = false;
+#endif
+            if (!synthetic_failure && PostMessageW(application_window, kStatusMessage,
+                0, reinterpret_cast<LPARAM>(status.get()))) {
+                status.release();
+            } else {
+                queue_status_failure(GetLastError());
+            }
         }
     } catch (...) {
-        OutputDebugStringW(L"[optic] Could not post status update\n");
+        try {
+            std::lock_guard<std::mutex> guard(window_mutex);
+            queue_status_failure(ERROR_NOT_ENOUGH_MEMORY);
+        } catch (...) {
+            OutputDebugStringW(L"[optic] Could not post status update\n");
+        }
     }
 }
 

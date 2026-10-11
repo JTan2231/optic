@@ -9,8 +9,11 @@
 using ActionCallback = bool(__cdecl*)(std::int32_t);
 using FrameCallback = void(__cdecl*)(std::uint64_t, void*, double, double, std::size_t, bool);
 using EventCallback = void(__cdecl*)(std::uint64_t, std::int32_t, const char*);
+// Events: 1 started, 2 stopped, 3 failed, 4 interrupted by the session/display.
+using ErrorCallback = void(__cdecl*)(const char*, const char*, const char*);
 
 extern "C" {
+void optic_set_error_callback(ErrorCallback callback);
 void optic_run(ActionCallback callback);
 void optic_set_status(std::int32_t state, const char* message);
 void optic_finish_quit();

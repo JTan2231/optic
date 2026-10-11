@@ -10,6 +10,46 @@ import Carbon
 private typealias OpticActionCallback = @convention(c) (Int32) -> Bool
 private var opticApplicationDelegate: OpticApplicationDelegate?
 
+public typealias OpticErrorCallback = @convention(c) (
+    UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?
+) -> Void
+
+// Registration occurs before native operations. The callback remains valid for
+// the process lifetime; the lock also makes diagnostic calls safe on workers.
+private final class NativeErrorLogger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: OpticErrorCallback?
+
+    func register(_ callback: @escaping OpticErrorCallback) {
+        lock.lock()
+        if self.callback == nil { self.callback = callback }
+        lock.unlock()
+    }
+
+    func error(component: String, event: String, message: String) {
+        lock.lock()
+        let callback = self.callback
+        lock.unlock()
+        if let callback {
+            component.withCString { componentPointer in
+                event.withCString { eventPointer in
+                    message.withCString { callback(componentPointer, eventPointer, $0) }
+                }
+            }
+        } else {
+            let diagnostic = "[optic] ERROR \(component) \(event): \(message)\n"
+            try? FileHandle.standardError.write(contentsOf: Data(diagnostic.utf8))
+        }
+    }
+}
+
+private let nativeErrorLogger = NativeErrorLogger()
+
+@_cdecl("optic_set_error_callback")
+public func opticSetErrorCallback(_ callback: @escaping OpticErrorCallback) {
+    nativeErrorLogger.register(callback)
+}
+
 @_cdecl("optic_run")
 public func opticRun(_ callback: @convention(c) (Int32) -> Bool) {
     let application = NSApplication.shared
@@ -171,10 +211,13 @@ private final class OpticApplicationDelegate: NSObject, NSApplicationDelegate {
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             if !NSWorkspace.shared.open(folder) {
-                log("Could not open recordings folder: \(folder.path)")
+                nativeErrorLogger.error(component: "ui", event: "recordings_folder.open_failed",
+                                        message: "Could not open the recordings folder.")
             }
         } catch {
-            log("Could not create recordings folder: \(error.localizedDescription)")
+            let failure = error as NSError
+            nativeErrorLogger.error(component: "ui", event: "recordings_folder.create_failed",
+                                    message: "Could not create the recordings folder (\(failure.domain) code \(failure.code)).")
         }
     }
 
@@ -208,7 +251,8 @@ private final class OpticApplicationDelegate: NSObject, NSApplicationDelegate {
             1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler
         )
         guard handlerStatus == noErr else {
-            showShortcutFailure("Global shortcuts unavailable (error \(handlerStatus))")
+            showShortcutFailure("Global shortcuts unavailable (error \(handlerStatus))",
+                                event: "shortcut.handler_failed")
             return
         }
 
@@ -218,25 +262,23 @@ private final class OpticApplicationDelegate: NSObject, NSApplicationDelegate {
             GetApplicationEventTarget(), 0, &toggleHotKey
         )
         if toggleStatus != noErr {
-            showShortcutFailure("Shortcut unavailable: ⌃⌥B (error \(toggleStatus))")
+            showShortcutFailure("Shortcut unavailable: ⌃⌥B (error \(toggleStatus))",
+                                event: "shortcut.register_failed")
         }
         let saveStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_S), modifiers, EventHotKeyID(signature: hotKeySignature, id: 2),
             GetApplicationEventTarget(), 0, &saveHotKey
         )
         if saveStatus != noErr {
-            showShortcutFailure("Shortcut unavailable: ⌃⌥S (error \(saveStatus))")
+            showShortcutFailure("Shortcut unavailable: ⌃⌥S (error \(saveStatus))",
+                                event: "shortcut.register_failed")
         }
     }
 
-    private func showShortcutFailure(_ description: String) {
+    private func showShortcutFailure(_ description: String, event: String) {
         let item = NSMenuItem(title: description, action: nil, keyEquivalent: "")
         item.isEnabled = false
         menu.insertItem(item, at: 1)
-        log(description)
-    }
-
-    private func log(_ description: String) {
-        fputs("[optic] \(description)\n", stderr)
+        nativeErrorLogger.error(component: "ui", event: event, message: description)
     }
 }

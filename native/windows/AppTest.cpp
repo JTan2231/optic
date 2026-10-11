@@ -14,6 +14,26 @@ std::atomic<unsigned> saves{0};
 std::atomic<unsigned> quits{0};
 std::atomic<unsigned> interruptions{0};
 std::atomic<bool> defer_quit{true};
+struct NativeError {
+    std::string component;
+    std::string event;
+    std::string message;
+};
+std::mutex errors_mutex;
+std::vector<NativeError> errors;
+std::atomic<bool> error_callback_failed{false};
+
+void __cdecl test_error(const char* component, const char* event, const char* message) noexcept {
+    try {
+        // Taking this lock also verifies that native logging never invokes the
+        // Rust-facing callback while holding the published-window mutex.
+        std::lock_guard<std::mutex> window_guard(window_mutex);
+        std::lock_guard<std::mutex> guard(errors_mutex);
+        errors.push_back({component ? component : "", event ? event : "", message ? message : ""});
+    } catch (...) {
+        error_callback_failed = true;
+    }
+}
 
 void expect(bool condition, const char* description) {
     if (!condition) throw std::runtime_error(description);
@@ -61,6 +81,29 @@ bool menu_enabled(HMENU menu, UINT command) {
     const UINT state = GetMenuState(menu, command, MF_BYCOMMAND);
     expect(state != static_cast<UINT>(-1), "Could not inspect menu enabled state");
     return !(state & (MF_DISABLED | MF_GRAYED));
+}
+
+void check_native_logging() {
+    std::wstring message = L"Native failure \x00B7 (Windows error 5)";
+    report_error("ui", "test.failed", message);
+    std::fill(message.begin(), message.end(), L'X');
+    expect(errors.size() == 1 && errors[0].component == "ui" && errors[0].event == "test.failed"
+        && errors[0].message == "Native failure \xC2\xB7 (Windows error 5)",
+        "The native error callback did not receive owned UTF-8 fields and the OS error code");
+    std::vector<std::thread> workers;
+    for (unsigned index = 0; index < 4; ++index) {
+        workers.emplace_back([] {
+            for (unsigned entry = 0; entry < 8; ++entry) {
+                report_error("ui", "test.concurrent_failed", L"Synthetic concurrent failure");
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    expect(errors.size() == 33 && !error_callback_failed, "Concurrent native error callbacks lost entries");
+    errors.clear();
+    optic_set_status(0, "Stopped");
+    optic_set_status(2, "Buffering");
+    expect(errors.empty(), "Normal statuses or Rust-owned returned errors were logged by the native callback");
 }
 
 void check_folder() {
@@ -170,6 +213,19 @@ public:
             app.active_menu_ = app.create_menu();
             expect(app.active_menu_ != nullptr, "Could not create the persistent test menu");
             check_menu(app, L"Start Buffering\tCtrl+Alt+B", true, false, true);
+            fail_next_status_post = true;
+        });
+        // Force the real status-post error path without changing any desktop
+        // resources. The callback itself takes window_mutex: synchronous
+        // reporting from optic_set_status would deadlock this test.
+        optic_set_status(2, "Synthetic dropped status");
+        invoke(window, [](Application& app) {
+            expect(app.state_ == 0 && app.message_ == L"Stopped", "A failed status post changed the UI state");
+            std::lock_guard<std::mutex> guard(errors_mutex);
+            expect(std::count_if(errors.begin(), errors.end(), [](const NativeError& error) {
+                return error.event == "tray.status_update_failed"
+                    && error.message.find(std::to_string(ERROR_NOT_ENOUGH_QUOTA)) != std::string::npos;
+            }) == 1, "A failed status post was not deferred and logged exactly once with its OS code");
         });
         post(window, WM_HOTKEY, kSaveCommand);
         post(window, WM_COMMAND, kToggleCommand);
@@ -246,8 +302,11 @@ extern "C" void optic_capture_interrupt() {
 
 int main() {
     try {
+        optic_set_error_callback(test_error);
+        check_native_logging();
         check_console();
         check_folder();
+        expect(errors.empty(), "Rust-owned recordings folder failures were logged twice");
         // A pre-existing external registration is also a valid conflict.
         const bool registered_conflict = RegisterHotKey(nullptr, 77, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'B') != FALSE;
         expect(registered_conflict || GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED,
@@ -277,10 +336,15 @@ int main() {
         worker.join();
         if (registered_conflict) UnregisterHotKey(nullptr, 77);
         if (failure) std::rethrow_exception(failure);
+        expect(!error_callback_failed && std::count_if(errors.begin(), errors.end(), [](const NativeError& error) {
+            return error.component == "shortcuts" && error.event == "shortcut.registration_failed"
+                && error.message.find("Ctrl+Alt+B") != std::string::npos
+                && error.message.find("error ") != std::string::npos;
+        }) == 1, "The failed shortcut registration was not logged exactly once with its native error code");
         expect(application_window == nullptr && quits == 1, "Deferred termination did not remove the tray window");
         optic_set_status(0, "Post-termination status");
         optic_finish_quit();
-        print_result("Windows tray self-test passed: menu states, shortcuts, status ownership, interruptions, deferred quit, folder lookup, console redirection\n");
+        print_result("Windows tray self-test passed: native error callbacks/filtering, menu states, shortcuts, status ownership, interruptions, deferred quit, folder lookup, console redirection\n");
         return 0;
     } catch (const std::exception& exception) {
         const std::string message = std::string("Windows tray self-test failed: ") + exception.what() + "\n";

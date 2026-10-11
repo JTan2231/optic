@@ -9,6 +9,8 @@ import VideoToolbox
 public typealias FrameCallback = @convention(c) (
     UInt64, UnsafeMutableRawPointer?, Double, Double, Int, Bool
 ) -> Void
+// Event kinds: 1 = started, 2 = stopped, 3 = error, 4 = expected interruption.
+// The message is borrowed UTF-8 and is valid only for the callback invocation.
 public typealias EventCallback = @convention(c) (UInt64, Int32, UnsafePointer<CChar>?) -> Void
 
 private struct MediaFailure: Error, CustomStringConvertible {
@@ -20,9 +22,18 @@ private func check(_ status: OSStatus, _ operation: String) throws {
     if status != noErr { throw MediaFailure("\(operation) failed (OSStatus \(status)).") }
 }
 
-private func writeError(_ error: Error, to buffer: UnsafeMutablePointer<CChar>?, capacity: Int) {
+private func mediaErrorDescription(_ error: Error, operation: String) -> String {
+    if let failure = error as? MediaFailure { return failure.description }
+    // NSError descriptions and userInfo can contain personal output paths.
+    // Preserve the native error identity alongside the operation instead.
+    let failure = error as NSError
+    return "\(operation) (\(failure.domain) code \(failure.code))."
+}
+
+private func writeError(_ error: Error, operation: String,
+                        to buffer: UnsafeMutablePointer<CChar>?, capacity: Int) {
     guard let buffer, capacity > 0 else { return }
-    let bytes = Array(String(describing: error).utf8.prefix(capacity - 1))
+    let bytes = Array(mediaErrorDescription(error, operation: operation).utf8.prefix(capacity - 1))
     for (index, byte) in bytes.enumerated() { buffer[index] = CChar(bitPattern: byte) }
     buffer[bytes.count] = 0
 }
@@ -217,7 +228,7 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             self.queue.async {
                 guard !self.stopping, !self.finished else { return }
                 if let error {
-                    self.fail("Unable to capture the screen: \(error.localizedDescription)")
+                    self.fail(mediaErrorDescription(error, operation: "Unable to capture the screen"))
                     return
                 }
                 guard let display = content?.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
@@ -249,7 +260,9 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                     stream.startCapture { error in
                         self.queue.async { self.didStart(error) }
                     }
-                } catch { self.fail(String(describing: error)) }
+                } catch {
+                    self.fail(mediaErrorDescription(error, operation: "Unable to configure screen capture"))
+                }
             }
         }
     }
@@ -260,7 +273,10 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             if error == nil { stopStream() } else { finishStop() }
             return
         }
-        if let error { fail("Unable to start screen capture: \(error.localizedDescription)"); return }
+        if let error {
+            fail(mediaErrorDescription(error, operation: "Unable to start screen capture"))
+            return
+        }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .nanoseconds(33_333_333), leeway: .milliseconds(2))
         timer.setEventHandler { [weak self] in self?.encodeLatestFrame() }
@@ -273,7 +289,7 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopping, let latestPixelBuffer, let encoder else { return }
         do {
             try encoder.encode(latestPixelBuffer, at: CMClockGetTime(CMClockGetHostTimeClock()))
-        } catch { fail(String(describing: error)) }
+        } catch { fail(mediaErrorDescription(error, operation: "Unable to encode the screen capture")) }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of outputType: SCStreamOutputType) {
@@ -286,7 +302,7 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         case .idle: return // The encoding timer repeats the last complete image.
         case .blank, .suspended, .stopped:
             latestPixelBuffer = nil
-            fail("Screen capture was interrupted. Resume buffering when the display is available.")
+            interrupt("Screen capture was interrupted. Resume buffering when the display is available.")
             return
         case .complete, .started: break
         @unknown default: return
@@ -294,19 +310,25 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         guard CVPixelBufferGetWidth(pixelBuffer) == width,
               CVPixelBufferGetHeight(pixelBuffer) == height else {
-            fail("The screen capture size changed. Resume buffering to start a new video stream.")
+            interrupt("The screen capture size changed. Resume buffering to start a new video stream.")
             return
         }
         latestPixelBuffer = pixelBuffer
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        queue.async { self.fail("Screen capture stopped: \(error.localizedDescription)") }
+        queue.async { self.fail(mediaErrorDescription(error, operation: "Screen capture stopped unexpectedly")) }
     }
 
     private func fail(_ message: String) {
         guard !stopping, !finished else { return }
         event(3, message)
+        stop(emitStopped: false)
+    }
+
+    private func interrupt(_ message: String) {
+        guard !stopping, !finished else { return }
+        event(4, message)
         stop(emitStopped: false)
     }
 
@@ -487,7 +509,7 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
         succeeded = true
         return true
     } catch {
-        writeError(error, to: errorBuffer, capacity: errorCapacity)
+        writeError(error, operation: "Exporting the MP4 failed", to: errorBuffer, capacity: errorCapacity)
         return false
     }
 }
@@ -532,7 +554,7 @@ public func optic_generate_test_video(_ generation: UInt64, _ frames: @escaping 
         return true
     } catch {
         gate.disable()
-        writeError(error, to: errorBuffer, capacity: errorCapacity)
+        writeError(error, operation: "Generating the test video failed", to: errorBuffer, capacity: errorCapacity)
         return false
     }
 }

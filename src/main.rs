@@ -7,6 +7,8 @@
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod buffer;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod logging;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app;

@@ -2,6 +2,7 @@
 name = "optic"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "A macOS and Windows tray instant replay recorder"
 license = "MIT"
 repository = "https://github.com/jtan2231/optic"

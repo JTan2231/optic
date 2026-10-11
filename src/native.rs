@@ -12,8 +12,10 @@ use std::{
 
 pub type FrameCallback = extern "C" fn(u64, *mut c_void, f64, f64, usize, bool);
 pub type EventCallback = extern "C" fn(u64, i32, *const c_char);
+type ErrorCallback = extern "C" fn(*const c_char, *const c_char, *const c_char);
 
 unsafe extern "C" {
+    fn optic_set_error_callback(callback: ErrorCallback);
     pub fn optic_run(callback: extern "C" fn(i32) -> bool);
     pub fn optic_finish_quit();
     pub fn optic_set_status(state: i32, message: *const c_char);
@@ -51,6 +53,31 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> bool;
+}
+
+/// Registers the process-lifetime diagnostic callback before native work starts.
+pub fn initialize_error_reporting() {
+    // SAFETY: This callback has the native C ABI and static lifetime. Native
+    // code invokes it without holding its UI locks and retains no Rust data.
+    unsafe { optic_set_error_callback(native_error) };
+}
+
+extern "C" fn native_error(component: *const c_char, event: *const c_char, message: *const c_char) {
+    // A logger failure must never unwind through the native C ABI.
+    let _ = std::panic::catch_unwind(|| {
+        let copy = |pointer: *const c_char| {
+            if pointer.is_null() {
+                String::new()
+            } else {
+                // SAFETY: Native code supplies NUL-terminated strings valid
+                // until this callback returns. Copy before retaining anything.
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        crate::logging::error(&copy(component), &copy(event), &copy(message), None);
+    });
 }
 
 /// Owns one immutable compressed sample transferred by the native bridge.

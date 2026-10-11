@@ -70,6 +70,31 @@ The default shortcuts and replay length are currently fixed. If another app
 has claimed a shortcut, Optic shows the registration failure in its menu; the
 menu actions still work.
 
+## Error logs
+
+Optic records capture, encoding, saving, shortcut, tray, and command-line
+operation failures in local UTF-8 text logs. Normal recording statuses,
+successful operations and known sleep/lock/display
+interruptions create no entries. The tray still displays recording status and
+interruptions.
+
+Logs are stored in `%LOCALAPPDATA%\Optic\Logs` on Windows and
+`~/Library/Logs/Optic` on macOS. Each process creates its own `optic-*` session
+folder on its first error, containing `errors.log` and up to two rotated files.
+Each file is capped at 1 MiB; cleanup retains the newest ten completed sessions
+and skips active processes. These folders are separate from recordings and the
+installation directory, so upgrades preserve them.
+
+Each error includes a Unix timestamp in milliseconds, app version, platform,
+process ID, component, event, message, and capture generation when applicable.
+Native error codes are preserved; personal home paths are redacted and folder
+diagnostics omit full paths. Messages are escaped and bounded to one line.
+
+Logging uses synchronous writes outside recorder locks. If logging fails, Optic
+attempts stderr output and continues handling the original operation. Panic
+logging is best effort; native crashes and forced termination may leave no
+entry. Tests use temporary log folders and do not capture your screen.
+
 ## Verify
 
 Run the PowerShell 7 CI script to apply supported Rust/Swift fixes and then
@@ -85,7 +110,7 @@ pwsh -File ./scripts/ci.ps1 -RequireMacOS
 pwsh -File ./scripts/ci.ps1 -RequireWindows
 ```
 
-Install Rust with the `clippy` and `rustfmt` components. Full app checks also
+Install Rust 1.89 or newer with the `clippy` and `rustfmt` components. Full app checks also
 require the native build tools described above. macOS lint checks require
 Xcode 16 or newer with `swift-format`. Windows runs compile the native bridge
 with MSVC `/W4 /WX`, test the real media pipeline, and build the packaged app.
@@ -137,6 +162,7 @@ default synthetic tests do not invoke it.
 ## Source
 
 - `src/app.rs`: start/stop lifecycle, native callbacks, save jobs.
+- `src/logging.rs`: error records, bounded per-process logs, retention, and panic diagnostics.
 - `src/buffer.rs`: bounded compressed history and independent save snapshots.
 - `native/Media.swift`: capture, encoding, and finalized MP4 export.
 - `native/App.swift`: menu bar and global shortcuts.

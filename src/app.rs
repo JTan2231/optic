@@ -1,5 +1,6 @@
 use crate::{
     buffer::{Frame, ReplayBuffer},
+    logging,
     native::{self, Sample},
 };
 use std::{
@@ -63,7 +64,6 @@ fn recorder() -> MutexGuard<'static, Recorder> {
 fn publish(phase: Phase, message: &str) {
     // Call with the recorder mutex held: enqueueing native UI updates in state
     // transition order prevents a delayed callback from restoring an old state.
-    eprintln!("Optic: {message}");
     let Ok(message) = CString::new(message.replace('\0', " ")) else {
         return;
     };
@@ -168,6 +168,11 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
     if state.shutdown || generation != state.generation {
         return;
     }
+    // Terminal callbacks can race cancellation or arrive twice. Only the
+    // active capture can fail; old/canceled work must not create error noise.
+    if matches!(event, 3 | 4) && !matches!(state.phase, Phase::Starting | Phase::Buffering) {
+        return;
+    }
     let output = match event {
         1 if state.phase == Phase::Starting => {
             state.phase = Phase::Buffering;
@@ -183,18 +188,26 @@ extern "C" fn capture_event(generation: u64, event: i32, message: *const c_char)
             state.buffer.clear();
             Some((Phase::Stopped, format!("Capture failed: {message}")))
         }
+        4 => {
+            state.phase = Phase::Stopped;
+            state.buffer.clear();
+            Some((Phase::Stopped, message.clone()))
+        }
         _ => None,
     };
     if let Some((phase, message)) = output {
         publish(phase, &message);
     }
     drop(state);
+    if event == 3 {
+        logging::error("capture", "capture.failed", &message, Some(generation));
+    }
 }
 
 fn recording_path() -> Result<PathBuf, String> {
     let folder = native::recordings_folder()?;
     std::fs::create_dir_all(&folder)
-        .map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
+        .map_err(|e| format!("Cannot create recordings folder: {e}"))?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?;
@@ -230,32 +243,49 @@ fn save() {
     }
     state.saving = true;
     let duration = state.buffer.duration();
+    let generation = state.generation;
     publish(Phase::Buffering, &format!("Saving {duration:.1} seconds…"));
     drop(state);
-    std::thread::spawn(move || {
-        let result = recording_path().and_then(|path| {
-            export(&frames, &path)?;
-            Ok(path)
+    let worker = std::thread::Builder::new()
+        .name("optic-save".into())
+        .spawn(move || {
+            let result = recording_path().and_then(|path| {
+                export(&frames, &path)?;
+                Ok(path)
+            });
+            // Drop the snapshot before announcing completion. A stopped buffer
+            // remains empty; an already requested save owns its own references.
+            drop(frames);
+            finish_save(result, generation);
         });
-        // Drop the snapshot before announcing completion. A stopped buffer
-        // remains empty; an already requested save owns its own references.
-        drop(frames);
-        let mut state = recorder();
-        state.saving = false;
-        let phase = state.phase;
-        let shutdown = state.shutdown;
-        if shutdown {
-            drop(state);
-            // SAFETY: The bridge enqueues termination on the main run loop;
-            // it takes no pointers and may be called from this worker thread.
-            unsafe { native::optic_finish_quit() };
-            return;
-        }
-        match result {
-            Ok(path) => publish(phase, &format!("Saved {}", path.display())),
-            Err(error) => publish(phase, &format!("Save failed: {error}")),
-        }
-    });
+    if let Err(error) = worker {
+        finish_save(
+            Err(format!("Could not start save worker: {error}")),
+            generation,
+        );
+    }
+}
+
+fn finish_save(result: Result<PathBuf, String>, generation: u64) {
+    // Persist errors before locking the recorder or taking the deferred-quit
+    // branch. A failed last clip must be reported even when its UI is closing.
+    if let Err(error) = &result {
+        logging::error("export", "save.failed", error, Some(generation));
+    }
+    let mut state = recorder();
+    state.saving = false;
+    let phase = state.phase;
+    if state.shutdown {
+        drop(state);
+        // SAFETY: The bridge enqueues termination on the main run loop;
+        // it takes no pointers and may be called from this worker thread.
+        unsafe { native::optic_finish_quit() };
+        return;
+    }
+    match result {
+        Ok(path) => publish(phase, &format!("Saved {}", path.display())),
+        Err(error) => publish(phase, &format!("Save failed: {error}")),
+    }
 }
 
 static TEST_BUFFER: OnceLock<Mutex<ReplayBuffer<Arc<Sample>>>> = OnceLock::new();
@@ -341,6 +371,8 @@ pub fn run() {
     if first.is_some() {
         native::prepare_console();
     }
+    logging::init();
+    native::initialize_error_reporting();
     if first
         .as_ref()
         .is_some_and(|argument| argument.to_str().is_none())
@@ -355,6 +387,7 @@ pub fn run() {
                 PathBuf::from,
             );
             if let Err(error) = self_test(&path) {
+                logging::error("cli", "self_test.failed", &error, None);
                 eprintln!("Media self-test failed: {error}");
                 std::process::exit(1);
             }
@@ -386,5 +419,128 @@ pub fn run() {
             // the required C ABI and remains available for the app's lifetime.
             unsafe { native::optic_run(action) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        error::Error,
+        fs, io,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestLogs(PathBuf);
+
+    impl TestLogs {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "optic-app-logs-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+
+        fn contents(&self) -> io::Result<String> {
+            let mut output = String::new();
+            for session in fs::read_dir(&self.0)? {
+                let session = session?;
+                if !session.file_type()?.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(session.path())? {
+                    let path = entry?.path();
+                    if path.extension().is_some_and(|extension| extension == "log") {
+                        output.push_str(&fs::read_to_string(path)?);
+                    }
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    impl Drop for TestLogs {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn reset_recorder(phase: Phase, generation: u64) {
+        let mut state = recorder();
+        *state = Recorder::new();
+        state.phase = phase;
+        state.generation = generation;
+    }
+
+    #[test]
+    fn capture_errors_log_once_and_ignore_canceled_or_stale_work() -> Result<(), Box<dyn Error>> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        let message = CString::new("Encoder failed (HRESULT 0x80004005)")?;
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Starting, 7);
+            capture_event(6, 3, message.as_ptr());
+            assert_eq!(recorder().phase, Phase::Starting);
+            capture_event(7, 3, message.as_ptr());
+            assert_eq!(recorder().phase, Phase::Stopped);
+            capture_event(7, 3, message.as_ptr());
+            reset_recorder(Phase::Stopping, 8);
+            capture_event(8, 3, message.as_ptr());
+            assert_eq!(recorder().phase, Phase::Stopping);
+        });
+        let output = logs.contents()?;
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("capture.failed"));
+        assert!(output.contains("generation=7"));
+        assert!(output.contains("0x80004005"));
+        Ok(())
+    }
+
+    #[test]
+    fn normal_statuses_and_interruptions_create_no_logs() -> Result<(), Box<dyn Error>> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        let message = CString::new("Screen capture was interrupted")?;
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Starting, 9);
+            capture_event(9, 1, std::ptr::null());
+            assert_eq!(recorder().phase, Phase::Buffering);
+            capture_event(9, 4, message.as_ptr());
+            assert_eq!(recorder().phase, Phase::Stopped);
+            capture_event(9, 2, std::ptr::null());
+            finish_save(Ok(PathBuf::from("successful.mp4")), 9);
+        });
+        assert!(!logs.0.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_final_save_is_logged_before_deferred_quit() -> Result<(), Box<dyn Error>> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Stopped, 11);
+            {
+                let mut state = recorder();
+                state.saving = true;
+                state.shutdown = true;
+            }
+            finish_save(Err("Finalizing the MP4 timed out".into()), 10);
+            let state = recorder();
+            assert!(!state.saving);
+            assert!(state.shutdown);
+            drop(state);
+        });
+        let output = logs.contents()?;
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("save.failed"));
+        assert!(output.contains("generation=10"));
+        assert!(output.contains("Finalizing the MP4 timed out"));
+        Ok(())
     }
 }

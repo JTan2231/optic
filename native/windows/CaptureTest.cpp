@@ -41,6 +41,7 @@ struct Generation {
     unsigned started = 0;
     unsigned stopped = 0;
     unsigned failed = 0;
+    unsigned interrupted = 0;
     bool boundary = false;
     bool invalid = false;
     std::string message;
@@ -78,7 +79,7 @@ void __cdecl received(std::uint64_t generation, void* sample, double pts,
         } else {
             auto& entry = found->second;
             ++entry.received;
-            if (entry.boundary || entry.stopped || entry.failed || !sample || !bytes ||
+            if (entry.boundary || entry.stopped || entry.failed || entry.interrupted || !sample || !bytes ||
                 !std::isfinite(pts) || !std::isfinite(duration) || pts < 0 ||
                 std::abs(duration - 1.0 / 30.0) > 0.000001 ||
                 (!entry.frames.empty() && pts <= entry.frames.back().pts) ||
@@ -105,13 +106,14 @@ void __cdecl event(std::uint64_t generation, std::int32_t kind, const char* mess
         } else {
             auto& entry = found->second;
             if (kind == 1) {
-                if (entry.stopped || entry.failed) entry.invalid = true;
+                if (entry.stopped || entry.failed || entry.interrupted) entry.invalid = true;
                 ++entry.started;
             }
             else if (kind == 2) ++entry.stopped;
             else if (kind == 3) ++entry.failed;
+            else if (kind == 4) ++entry.interrupted;
             else entry.invalid = true;
-            if (entry.started > 1 || entry.stopped + entry.failed > 1) entry.invalid = true;
+            if (entry.started > 1 || entry.stopped + entry.failed + entry.interrupted > 1) entry.invalid = true;
             entry.message = message ? message : "";
         }
     } catch (...) {
@@ -123,8 +125,8 @@ void __cdecl event(std::uint64_t generation, std::int32_t kind, const char* mess
 void validate(const Generation& entry, bool allow_failure = false) {
     require(!state.callback_failure, "A native callback failed or used an unexpected generation");
     require(!entry.invalid, "Invalid, out-of-order or late native frame/event callback");
-    if (!allow_failure && entry.failed) {
-        throw std::runtime_error("Native capture failed: " + entry.message);
+    if (!allow_failure && (entry.failed || entry.interrupted)) {
+        throw std::runtime_error("Native capture ended unexpectedly: " + entry.message);
     }
 }
 
@@ -135,7 +137,7 @@ void await(std::uint64_t generation, Predicate predicate, std::chrono::seconds t
     auto& entry = state.generations.at(generation);
     const auto ready = [&] {
         return predicate(entry) || entry.invalid || state.callback_failure ||
-               (!allow_failure && entry.failed);
+               (!allow_failure && (entry.failed || entry.interrupted));
     };
     const bool completed = state.changed.wait_for(lock, timeout, ready);
     validate(entry, allow_failure);
@@ -147,7 +149,7 @@ void observe(std::uint64_t generation, std::chrono::milliseconds duration,
     std::unique_lock<std::mutex> lock(state.mutex);
     auto& entry = state.generations.at(generation);
     state.changed.wait_for(lock, duration, [&] {
-        return entry.invalid || state.callback_failure || (!allow_failure && entry.failed);
+        return entry.invalid || state.callback_failure || (!allow_failure && (entry.failed || entry.interrupted));
     });
     validate(entry, allow_failure);
 }
@@ -287,7 +289,8 @@ void stop_and_verify(std::uint64_t generation) {
     require(received_count(generation) == count, "Capture delivered a sample after stop returned");
     std::lock_guard<std::mutex> lock(state.mutex);
     const auto& entry = state.generations.at(generation);
-    require(entry.stopped == 1 && entry.failed == 0, "Capture must emit exactly one stopped event");
+    require(entry.stopped == 1 && entry.failed == 0 && entry.interrupted == 0,
+            "Capture must emit exactly one stopped event");
 }
 
 class CaptureCleanup final {
@@ -297,7 +300,7 @@ public:
         if (!active) return;
         optic_capture_stop(active);
         try {
-            await(active, [](const Generation& entry) { return entry.stopped || entry.failed; },
+            await(active, [](const Generation& entry) { return entry.stopped || entry.failed || entry.interrupted; },
                   10s, "Cleaning up capture timed out", true);
         } catch (...) {}
     }
@@ -358,15 +361,15 @@ int wmain(int count, wchar_t** args) {
         optic_capture_interrupt();
         mark_boundary(2);
         const auto at_interruption = received_count(2);
-        await(2, [](const Generation& entry) { return entry.failed != 0; },
-              10s, "Capture interruption did not emit a failure event", true);
+        await(2, [](const Generation& entry) { return entry.interrupted != 0; },
+              10s, "Capture interruption did not emit an interruption event", true);
         observe(2, 250ms, true);
         require(received_count(2) == at_interruption, "Capture delivered samples after interruption");
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             const auto& entry = state.generations.at(2);
-            require(entry.failed == 1 && entry.stopped == 0 && !entry.message.empty(),
-                    "Capture interruption must emit exactly one failure event");
+            require(entry.interrupted == 1 && entry.failed == 0 && entry.stopped == 0 && !entry.message.empty(),
+                    "Capture interruption must emit exactly one interruption event");
         }
         cleanup.active = 0;
         clear(2);

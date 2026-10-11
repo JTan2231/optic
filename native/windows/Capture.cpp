@@ -32,15 +32,22 @@ constexpr auto FrameInterval = std::chrono::nanoseconds(33'333'333);
 constexpr const char* Interrupted =
     "Screen capture was interrupted. Start buffering again when the display is available.";
 
-void check(HRESULT result, const char* operation) {
+class CaptureInterruption final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+void check(HRESULT result, const char* operation, bool runtime_capture = false) {
     if (SUCCEEDED(result)) return;
-    const bool interrupted = result == DXGI_ERROR_ACCESS_LOST || result == DXGI_ERROR_DEVICE_REMOVED ||
-        result == DXGI_ERROR_DEVICE_RESET || result == DXGI_ERROR_SESSION_DISCONNECTED ||
-        result == E_ACCESSDENIED;
+    // A live duplication stream loses access during desktop/session changes.
+    // Startup permission failures and device/encoder failures remain errors.
+    const bool interrupted = runtime_capture &&
+        (result == DXGI_ERROR_ACCESS_LOST || result == DXGI_ERROR_SESSION_DISCONNECTED);
     char text[512];
     std::snprintf(text, sizeof(text), "%s failed (HRESULT 0x%08lX).%s%s", operation,
                   static_cast<unsigned long>(result), interrupted ? " " : "",
                   interrupted ? Interrupted : "");
+    if (interrupted) throw CaptureInterruption(text);
     throw std::runtime_error(text);
 }
 
@@ -364,7 +371,7 @@ private:
         ComPtr<IDXGIResource> resource;
         const HRESULT result = duplication_->AcquireNextFrame(0, &info, &resource);
         if (result == DXGI_ERROR_WAIT_TIMEOUT) return;
-        check(result, "Reading the screen image");
+        check(result, "Reading the screen image", true);
         // Every successful acquire is released, including exceptions during
         // cursor retrieval, readback, rotation, or memory allocation.
         struct FrameLease {
@@ -387,7 +394,7 @@ private:
             UINT needed = 0;
             check(duplication_->GetFramePointerShape(static_cast<UINT>(pointer_.shape.size()),
                                                      pointer_.shape.data(), &needed, &pointer_.info),
-                  "Reading the cursor image");
+                  "Reading the cursor image", true);
             validate_pointer(pointer_);
             render_dirty_ = true;
         }
@@ -400,9 +407,11 @@ private:
                                   rotation_ == DXGI_MODE_ROTATION_ROTATE270;
             const UINT expected_width = portrait ? display_height_ : display_width_;
             const UINT expected_height = portrait ? display_width_ : display_height_;
-            if (desc.Width != expected_width || desc.Height != expected_height ||
-                desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1) {
-                throw std::runtime_error("The display size changed. Start buffering again to begin a new stream.");
+            if (desc.Width != expected_width || desc.Height != expected_height) {
+                throw CaptureInterruption("The display size changed. Start buffering again to begin a new stream.");
+            }
+            if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1) {
+                throw std::runtime_error("Screen capture supplied an unsupported image format.");
             }
             if (!staging_) {
                 auto staging_desc = desc;
@@ -427,7 +436,7 @@ private:
             render_dirty_ = true;
         }
         lease.active = false;
-        check(duplication_->ReleaseFrame(), "Releasing the captured image");
+        check(duplication_->ReleaseFrame(), "Releasing the captured image", true);
         check(device_->GetDeviceRemovedReason(), "Checking the screen capture device");
     }
 
@@ -471,12 +480,17 @@ struct Session {
 
     void finish_requested() {
         const auto kind = ending.load();
-        finish(kind == 3 ? 3 : 2, kind == 3 ? Interrupted : "Screen capture stopped.");
+        finish(kind == 4 ? 4 : 2, kind == 4 ? Interrupted : "Screen capture stopped.");
     }
 
     void fail(const char* text) {
         if (ending.load() != 0) finish_requested();
         else finish(3, text);
+    }
+
+    void interrupted(const char* text) {
+        if (ending.load() != 0) finish_requested();
+        else finish(4, text);
     }
 
     void finish(std::int32_t event_kind, const char* text) {
@@ -521,7 +535,7 @@ public:
     void interrupt() {
         auto session = requested();
         if (!session) return;
-        session->request_end(3);
+        session->request_end(4);
         wake_.notify_one();
     }
 
@@ -618,6 +632,10 @@ private:
             if (current && current->gate->enabled()) {
                 try {
                     current->capture->tick();
+                } catch (const CaptureInterruption& interruption) {
+                    current->interrupted(interruption.what());
+                    forget(current);
+                    current.reset();
                 } catch (const std::exception& error) {
                     current->fail(error.what());
                     forget(current);
@@ -688,6 +706,20 @@ int main() {
         if (!value) throw std::runtime_error(message);
     };
     try {
+        for (const HRESULT result : {DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_SESSION_DISCONNECTED,
+                DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, E_ACCESSDENIED, E_FAIL}) {
+            for (const bool runtime : {false, true}) {
+                bool interrupted = false;
+                bool failed = false;
+                try { check(result, "Synthetic capture operation", runtime); }
+                catch (const CaptureInterruption&) { interrupted = true; }
+                catch (const std::runtime_error&) { failed = true; }
+                const bool expected_interruption = runtime &&
+                    (result == DXGI_ERROR_ACCESS_LOST || result == DXGI_ERROR_SESSION_DISCONNECTED);
+                require(interrupted == expected_interruption && failed != interrupted,
+                    "Capture interruption/error classification");
+            }
+        }
         const std::vector<std::uint8_t> image = {
             1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255,
             4, 4, 4, 255, 5, 5, 5, 255, 6, 6, 6, 255};
@@ -732,7 +764,7 @@ int main() {
             0, 0, 0, 255, 40, 40, 40, 255, 80, 80, 80, 255, 120, 120, 120, 255};
         scale_desktop(square, 2, 2, 1, 1, scale_axis(2, 1), scale_axis(2, 1), scaled);
         require(scaled[0] == 60 && scaled[3] == 255, "Bilinear image scaling");
-        std::puts("Capture pixel tests passed: rotation, cursor masks, alpha, clipping, scaling.");
+        std::puts("Capture pixel tests passed: interruption classification, rotation, cursor masks, alpha, clipping, scaling.");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "Capture pixel test failed: %s\n", error.what());
