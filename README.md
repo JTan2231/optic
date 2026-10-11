@@ -29,6 +29,62 @@ shows the tray icon without opening a console or taskbar window. Click the
 icon to open its menu. Command-line `--help`, `-h`, and `--self-test [path.mp4]`
 work on both platforms; Windows CLI output also supports redirection.
 
+## Windows installer
+
+Download and run `OpticSetup.exe`, then choose **Finish → Launch Optic**.
+It installs for your Windows account in `%LOCALAPPDATA%\Programs\Optic`,
+adds a Start menu shortcut and an Installed apps entry, and requires no
+administrator access or developer tools. Optic launches in the tray **stopped**.
+**Launch Optic when I sign in** is optional and off on a new installation;
+upgrades remember your choice. Sign-in launches also start stopped.
+
+Only one Optic tray instance runs per user and Windows session, including
+copies launched from different folders. Installing an update finishes any
+active save, closes the running copy, and replaces the executable. Choose
+**Launch Optic** on the final page to reopen it stopped. Updates are installed
+by running a newer setup; there is no background updater.
+
+Uninstall through Windows' Installed apps. It waits for an active save and
+removes the program, shortcut, and sign-in entry. Your recordings are preserved.
+If shutdown fails or takes more than two minutes, maintenance stops before
+replacing or removing the app; let the save finish, quit from the tray, and retry.
+
+To build setup, install [Inno Setup 6.4 or newer](https://jrsoftware.org/isdl.php)
+along with the Windows build tools above, then run:
+
+```powershell
+pwsh -File ./scripts/build-installer.ps1
+# Use an existing packaged app or a compiler in a custom location:
+pwsh -File ./scripts/build-installer.ps1 -SkipAppBuild -IsccPath 'C:\tools\Inno Setup\ISCC.exe'
+```
+
+The output is `dist/OpticSetup.exe`; `dist/Optic.exe` remains usable as a
+portable app. `OPTIC_ISCC` can also select the compiler. The build rejects
+mismatched versions in `Cargo.toml` and `native/windows/Optic.rc`.
+For scripted shutdown, `Optic.exe --shutdown [seconds]` finishes an active save
+and waits for the current session's process to exit (default 120 seconds,
+maximum 600). Exit codes are 0 for closed or absent, 1 for shutdown failure,
+and 2 for invalid arguments. A timeout leaves the saving process intact.
+
+Local builds are unsigned. For a public release, obtain a trusted publisher
+signing identity and install its code-signing certificate with an accessible
+private key in `CurrentUser\My`. The signing scripts support certificates
+backed by a hardware token; they never export the key. Supply the certificate's
+40-character thumbprint and your provider's RFC 3161 timestamp URL:
+
+```powershell
+pwsh -File ./scripts/build-installer.ps1 -RequireSigning `
+  -CertificateThumbprint 'YOUR_40_HEX_CERTIFICATE_THUMBPRINT' `
+  -TimestampUrl 'https://YOUR_PROVIDER/RFC3161'
+```
+
+This signs and verifies the app before packaging, and signs and verifies setup
+and its embedded uninstaller with SHA-256 and timestamps. `-RequireSigning`
+fails without an explicit signing identity. `-SignToolPath` can override the
+Windows SDK tool. See [Microsoft's signing guidance](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/code-signing-options)
+for publisher certificates and signing services; a new signed release can
+still receive a SmartScreen reputation prompt.
+
 Optic appears as a recording circle in the menu bar or tray and starts **stopped**.
 The menu provides the same actions as the global shortcuts:
 
@@ -62,7 +118,8 @@ you choose Start Buffering or press its shortcut.
   also use memory.
 - Stops and clears history on capture failure or interruption. Sleep, screen
   locking, and display changes may require starting buffering again.
-- Processes one save at a time. No launch-at-login setting yet.
+- Processes one save at a time. The Windows installer can enable launch at sign-in;
+  macOS has no launch-at-login setting yet.
 
 Quitting while a save is active waits for that MP4 to finish before exiting.
 
@@ -74,7 +131,7 @@ menu actions still work.
 
 Optic records capture, encoding, saving, shortcut, tray, and command-line
 operation failures in local UTF-8 text logs. Normal recording statuses,
-successful operations and known sleep/lock/display
+successful operations, duplicate launches, and known sleep/lock/display
 interruptions create no entries. The tray still displays recording status and
 interruptions.
 
@@ -108,6 +165,8 @@ pwsh -File ./scripts/ci.ps1 -CheckOnly
 pwsh -File ./scripts/ci.ps1 -RequireMacOS
 # Require full Windows app coverage in CI:
 pwsh -File ./scripts/ci.ps1 -RequireWindows
+# Require Windows installer compilation too:
+pwsh -File ./scripts/ci.ps1 -CheckOnly -RequireWindows -RequireInstaller
 ```
 
 Install Rust 1.89 or newer with the `clippy` and `rustfmt` components. Full app checks also
@@ -117,6 +176,20 @@ with MSVC `/W4 /WX`, test the real media pipeline, and build the packaged app.
 Native tests cover cursor composition/rotation/scaling, tray menu states and
 deferred quitting, complete MP4 decoding, keyframe trimming, Unicode paths,
 and export failure cleanup. The synthetic checks do not capture your screen.
+Windows lifecycle tests also cover launches from different paths, maintenance
+locking, graceful process shutdown and timeout, and canceled session shutdown.
+When Inno Setup is available, CI compiles the installer; `-RequireInstaller`
+makes a missing compiler a failure. Actual install/upgrade/uninstall smoke tests
+are opt-in because they create a temporary per-user installation:
+
+```powershell
+pwsh -File ./scripts/test-installer.ps1
+```
+
+The smoke script refuses to replace an existing Optic installation, sign-in
+entry, or Start menu shortcut. It checks upgrade shutdown, startup preference
+persistence, single-instance behavior, uninstall cleanup, and preservation of
+an untracked recording fixture without capturing your screen.
 Each platform explicitly reports the other platform's checks as skipped;
 `-RequireMacOS` or `-RequireWindows` makes the corresponding gap a failure.
 Linux runs only cover the portable replay buffer.
@@ -170,6 +243,8 @@ default synthetic tests do not invoke it.
 - `native/windows/Capture.cpp`: Desktop Duplication, cursor composition, and capture lifecycle.
 - `native/windows/Media.cpp`: Media Foundation H.264 encoding and MP4 export.
 - `build.rs`: compiles and links the native bridge into the Rust executable.
+- `installer/Optic.iss`: per-user Windows install, upgrades, and uninstall.
+- `scripts/build-installer.ps1`: installer build and optional release signing.
 
 Use the bundled app for ordinary use so macOS sees its stable bundle identifier.
 The build script applies a local ad-hoc signature; rebuilding or moving the app

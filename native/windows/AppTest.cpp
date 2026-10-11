@@ -14,6 +14,7 @@ std::atomic<unsigned> saves{0};
 std::atomic<unsigned> quits{0};
 std::atomic<unsigned> interruptions{0};
 std::atomic<bool> defer_quit{true};
+std::atomic<bool> saving_clip{false};
 struct NativeError {
     std::string component;
     std::string event;
@@ -44,6 +45,7 @@ bool __cdecl test_action(std::int32_t action) {
         case 1: ++toggles; return true;
         case 2: ++saves; return true;
         case 3: ++quits; return !defer_quit.load();
+        case 4: return !saving_clip.load();
         default: return true;
     }
 }
@@ -83,6 +85,151 @@ bool menu_enabled(HMENU menu, UINT command) {
     return !(state & (MF_DISABLED | MF_GRAYED));
 }
 
+HANDLE start_child(const std::wstring& path, const std::wstring& arguments) {
+    std::wstring command = L"\"" + path + L"\" " + arguments;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    expect(CreateProcessW(path.c_str(), command.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != FALSE,
+        "Could not start the lifecycle test child");
+    CloseHandle(process.hThread);
+    return process.hProcess;
+}
+
+void check_child_exit(HANDLE child, DWORD timeout) {
+    expect(WaitForSingleObject(child, timeout) == WAIT_OBJECT_0, "Lifecycle test child did not exit on time");
+    DWORD code = 1;
+    expect(GetExitCodeProcess(child, &code) && code == 0, "Lifecycle test child failed");
+}
+
+void check_lifecycle() {
+    char error[256]{};
+    expect(optic_shutdown(1000, error, std::size(error)), "Shutdown of an absent instance should succeed");
+    wchar_t executable[32768]{}, temporary[32768]{};
+    const DWORD exe_length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    const DWORD temp_length = GetTempPathW(static_cast<DWORD>(std::size(temporary)), temporary);
+    expect(exe_length > 0 && exe_length < std::size(executable) && temp_length > 0
+        && temp_length < std::size(temporary), "Could not locate lifecycle test paths");
+    const std::wstring directory = std::wstring(temporary) + L"Optic-shell-lifecycle-" + std::to_wstring(GetCurrentProcessId());
+    expect(CreateDirectoryW(directory.c_str(), nullptr) != FALSE, "Could not create the lifecycle test directory");
+    const std::wstring copied_executable = directory + L"\\Optic-copy.exe";
+    expect(CopyFileW(executable, copied_executable.c_str(), FALSE) != FALSE, "Could not copy the lifecycle test executable");
+    const auto suffix = std::to_wstring(GetCurrentProcessId());
+    const std::wstring ready_name = L"Local\\Optic.Test.Ready." + suffix;
+    const std::wstring finish_name = L"Local\\Optic.Test.Finish." + suffix;
+    Handle ready(CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str()));
+    Handle finish(CreateEventW(nullptr, TRUE, FALSE, finish_name.c_str()));
+    expect(ready.get() && finish.get(), "Could not create the lifecycle test events");
+    try {
+        {
+            MutexLease maintenance(kMaintenanceMutex);
+            expect(maintenance.acquire(), "Could not hold the installer maintenance lease");
+            Handle blocked(start_child(copied_executable, L"--lifecycle-probe"));
+            check_child_exit(blocked.get(), 1000);
+            expect(FindWindowW(kWindowClass, instance_name().c_str()) == nullptr,
+                "A launch created its tray while installation held the maintenance lease");
+        }
+        const std::wstring arguments = L"--lifecycle-child " + ready_name + L" " + finish_name;
+        Handle running(start_child(executable, arguments));
+        try {
+            expect(WaitForSingleObject(ready.get(), 5000) == WAIT_OBJECT_0, "The lifecycle child did not publish its tray");
+            // Launch the same program from another directory: executable paths
+            // must not allow another instance to register its own shortcuts.
+            Handle duplicate(start_child(copied_executable, L"--lifecycle-probe"));
+            check_child_exit(duplicate.get(), 1000);
+            expect(!optic_shutdown(80, error, std::size(error)), "Shutdown should time out while a clip is deliberately pending");
+            expect(std::strstr(error, "Timed out") != nullptr
+                && WaitForSingleObject(running.get(), 0) == WAIT_TIMEOUT,
+                "Timed-out shutdown did not leave the saving instance alive");
+            SetEvent(finish.get());
+            expect(optic_shutdown(5000, error, std::size(error)), "Shutdown did not wait for deferred save completion and process exit");
+            check_child_exit(running.get(), 1000);
+            expect(optic_shutdown(1000, error, std::size(error)), "Repeated shutdown should be harmless");
+        } catch (...) {
+            SetEvent(finish.get());
+            WaitForSingleObject(running.get(), 10000);
+            throw;
+        }
+        ResetEvent(ready.get());
+        ResetEvent(finish.get());
+        Handle legacy(start_child(copied_executable,
+            L"--legacy-lifecycle-child " + ready_name + L" " + finish_name));
+        try {
+            expect(WaitForSingleObject(ready.get(), 5000) == WAIT_OBJECT_0, "The legacy portable child did not publish its tray");
+            expect(!optic_shutdown(80, error, std::size(error))
+                && WaitForSingleObject(legacy.get(), 0) == WAIT_TIMEOUT,
+                "Legacy portable shutdown should defer and leave a pending save alive");
+            SetEvent(finish.get());
+            expect(optic_shutdown(5000, error, std::size(error)), "The legacy portable instance was not closed gracefully");
+            check_child_exit(legacy.get(), 1000);
+        } catch (...) {
+            SetEvent(finish.get());
+            WaitForSingleObject(legacy.get(), 10000);
+            throw;
+        }
+    } catch (...) {
+        DeleteFileW(copied_executable.c_str());
+        RemoveDirectoryW(directory.c_str());
+        throw;
+    }
+    expect(DeleteFileW(copied_executable.c_str()) && RemoveDirectoryW(directory.c_str()),
+        "Could not clean up the lifecycle test executable");
+}
+
+int lifecycle_child(int argc, char** argv) {
+    if (std::strcmp(argv[1], "--lifecycle-probe") == 0) {
+        defer_quit = false;
+        Handle complete(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        expect(complete.get() != nullptr, "Could not create the lifecycle probe watchdog");
+        std::thread watchdog([&complete] {
+            if (WaitForSingleObject(complete.get(), 2000) == WAIT_TIMEOUT) {
+                std::lock_guard<std::mutex> guard(window_mutex);
+                if (application_window) PostMessageW(application_window, WM_CLOSE, 0, 0);
+            }
+        });
+        optic_run(test_action);
+        SetEvent(complete.get());
+        watchdog.join();
+        expect(errors.empty() && !error_callback_failed,
+            "Already-running/maintenance launch refusal was reported as an error");
+        return 0;
+    }
+    const bool legacy = std::strcmp(argv[1], "--legacy-lifecycle-child") == 0;
+    expect(argc == 4 && (legacy || std::strcmp(argv[1], "--lifecycle-child") == 0), "Invalid lifecycle child arguments");
+    Handle ready(OpenEventW(EVENT_MODIFY_STATE, FALSE, from_utf8(argv[2]).c_str()));
+    Handle finish(OpenEventW(SYNCHRONIZE, FALSE, from_utf8(argv[3]).c_str()));
+    expect(ready.get() && finish.get(), "Could not open lifecycle child events");
+    saving_clip = true;
+    std::thread completion([&ready, &finish] {
+        for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+            bool initialized = false;
+            {
+                std::lock_guard<std::mutex> guard(window_mutex);
+                initialized = application_window != nullptr;
+            }
+            if (initialized) { SetEvent(ready.get()); break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        WaitForSingleObject(finish.get(), 10000);
+        saving_clip = false;
+        defer_quit = false;
+        optic_finish_quit();
+        std::lock_guard<std::mutex> guard(window_mutex);
+        if (application_window) PostMessageW(application_window, WM_CLOSE, 0, 0);
+    });
+    if (legacy) {
+        // Simulate the pre-installer portable shell: no named mutex, the old
+        // window title, and WM_CLOSE with deferred quit support.
+        Application application(test_action);
+        if (application.initialize(kLegacyWindowTitle)) application.run();
+    } else {
+        optic_run(test_action);
+    }
+    completion.join();
+    return quits == 1 ? 0 : 1;
+}
+
 void check_native_logging() {
     std::wstring message = L"Native failure \x00B7 (Windows error 5)";
     report_error("ui", "test.failed", message);
@@ -103,6 +250,8 @@ void check_native_logging() {
     errors.clear();
     optic_set_status(0, "Stopped");
     optic_set_status(2, "Buffering");
+    char error[256]{};
+    expect(!optic_shutdown(0, error, std::size(error)), "Invalid shutdown timeout unexpectedly succeeded");
     expect(errors.empty(), "Normal statuses or Rust-owned returned errors were logged by the native callback");
 }
 
@@ -267,6 +416,28 @@ public:
         invoke(window, [](Application&) {
             expect(interruptions == 3, "Power, session, and display interruption notifications were not forwarded");
         });
+        saving_clip = true;
+        DWORD_PTR query_result = TRUE;
+        expect(SendMessageTimeoutW(window, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP,
+            SMTO_ABORTIFHUNG, 1000, &query_result) && query_result == FALSE,
+            "Restart Manager should defer replacement while a clip is saving");
+        invoke(window, [](Application& app) {
+            expect(quits == 0 && !app.quitting_ && app.state_ == 2,
+                "A blocked session query initiated irreversible quit cleanup");
+        });
+        saving_clip = false;
+        expect(SendMessageTimeoutW(window, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP,
+            SMTO_ABORTIFHUNG, 1000, &query_result) && query_result == TRUE,
+            "An idle recorder should approve a session shutdown query");
+        post(window, WM_HOTKEY, kToggleCommand);
+        post(window, WM_HOTKEY, kSaveCommand);
+        post(window, WM_ENDSESSION, FALSE, ENDSESSION_CLOSEAPP);
+        invoke(window, [](Application& app) {
+            expect(quits == 0 && toggles == 3 && saves == 1 && !app.quitting_ && !app.session_ending_,
+                "A canceled shutdown query changed capture or accepted a new action before resolution");
+            check_menu(app, L"Stop Buffering\tCtrl+Alt+B", true, true, true);
+        });
+        post(window, WM_ENDSESSION, TRUE, ENDSESSION_CLOSEAPP);
         post(window, WM_COMMAND, kQuitCommand);
         optic_set_status(0, "Should be ignored during quitting");
         post(window, WM_HOTKEY, kToggleCommand);
@@ -300,13 +471,15 @@ extern "C" void optic_capture_interrupt() {
     ++interruptions;
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         optic_set_error_callback(test_error);
+        if (argc > 1) return lifecycle_child(argc, argv);
         check_native_logging();
         check_console();
         check_folder();
         expect(errors.empty(), "Rust-owned recordings folder failures were logged twice");
+        check_lifecycle();
         // A pre-existing external registration is also a valid conflict.
         const bool registered_conflict = RegisterHotKey(nullptr, 77, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'B') != FALSE;
         expect(registered_conflict || GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED,
@@ -344,7 +517,7 @@ int main() {
         expect(application_window == nullptr && quits == 1, "Deferred termination did not remove the tray window");
         optic_set_status(0, "Post-termination status");
         optic_finish_quit();
-        print_result("Windows tray self-test passed: native error callbacks/filtering, menu states, shortcuts, status ownership, interruptions, deferred quit, folder lookup, console redirection\n");
+        print_result("Windows tray self-test passed: native error callbacks/filtering, menu states, shortcuts, status ownership, interruptions, deferred quit, session query cancellation, cross-path single instance, maintenance launch protection, bounded graceful process shutdown, folder lookup, console redirection\n");
         return 0;
     } catch (const std::exception& exception) {
         const std::string message = std::string("Windows tray self-test failed: ") + exception.what() + "\n";

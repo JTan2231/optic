@@ -8,6 +8,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wtsapi32.h>
+#include <sddl.h>
 
 #include "Bridge.h"
 
@@ -28,6 +29,17 @@
 
 namespace {
 constexpr wchar_t kWindowClass[] = L"Optic.TrayWindow";
+constexpr wchar_t kShutdownMessageName[] = L"Optic.Shutdown.v1";
+#ifdef OPTIC_UI_TEST
+// Shell tests must never close a real installed or portable Optic instance.
+constexpr wchar_t kInstancePrefix[] = L"Local\\Optic.Test.Instance.";
+constexpr wchar_t kMaintenanceMutex[] = L"Local\\Optic.Test.Maintenance.v1";
+constexpr wchar_t kLegacyWindowTitle[] = L"Optic.Test.Legacy";
+#else
+constexpr wchar_t kInstancePrefix[] = L"Local\\Optic.Instance.";
+constexpr wchar_t kMaintenanceMutex[] = L"Local\\Optic.Maintenance.v1";
+constexpr wchar_t kLegacyWindowTitle[] = L"Optic";
+#endif
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
 constexpr UINT kFinishQuitMessage = WM_APP + 3;
@@ -57,6 +69,107 @@ std::atomic<DWORD> pending_status_error{ERROR_SUCCESS};
 struct Status {
     std::int32_t state;
     std::wstring message;
+};
+
+class Handle {
+public:
+    explicit Handle(HANDLE value = nullptr) noexcept : value_(value) {}
+    ~Handle() { if (value_) CloseHandle(value_); }
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    HANDLE get() const noexcept { return value_; }
+    HANDLE release() noexcept {
+        const HANDLE result = value_;
+        value_ = nullptr;
+        return result;
+    }
+private:
+    HANDLE value_;
+};
+
+std::runtime_error windows_error(const char* operation) {
+    return std::runtime_error(std::string(operation) + " (Windows error "
+        + std::to_string(GetLastError()) + ")");
+}
+
+std::wstring user_sid(HANDLE process) {
+    HANDLE raw_token = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &raw_token)) throw windows_error("Could not identify the Optic user");
+    Handle token(raw_token);
+    DWORD bytes = 0;
+    GetTokenInformation(token.get(), TokenUser, nullptr, 0, &bytes);
+    if (!bytes) throw windows_error("Could not read the Optic user");
+    std::vector<unsigned char> data(bytes);
+    if (!GetTokenInformation(token.get(), TokenUser, data.data(), bytes, &bytes)) {
+        throw windows_error("Could not read the Optic user");
+    }
+    LPWSTR raw_sid = nullptr;
+    const auto* user = reinterpret_cast<const TOKEN_USER*>(data.data());
+    if (!ConvertSidToStringSidW(user->User.Sid, &raw_sid)) throw windows_error("Could not identify the Optic user");
+    std::unique_ptr<wchar_t, decltype(&LocalFree)> sid(raw_sid, LocalFree);
+    return sid.get();
+}
+
+std::wstring instance_name() {
+    // Local names are isolated by Windows session. The SID also isolates Run
+    // As users within that session, and the name never depends on the exe path.
+    return kInstancePrefix + user_sid(GetCurrentProcess());
+}
+
+bool shutdown_window(HWND window, UINT message, const std::wstring& sid, DWORD own_session, DWORD timeout) {
+    DWORD process_id = 0;
+    if (!GetWindowThreadProcessId(window, &process_id)) return true;
+    Handle process(OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
+    if (!process.get()) {
+        // The window can disappear between lookup and OpenProcess.
+        if (GetLastError() == ERROR_INVALID_PARAMETER) return true;
+        throw windows_error("Could not wait for Optic to close");
+    }
+    if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) return true;
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(process_id, &session)) throw windows_error("Could not identify the running Optic session");
+    if (session != own_session || user_sid(process.get()) != sid) return false;
+    if (!PostMessageW(window, message, 0, 0)) {
+        if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) return true;
+        throw windows_error("Could not request Optic shutdown");
+    }
+    // The executable stays in use until process exit, beyond tray removal.
+    const DWORD result = WaitForSingleObject(process.get(), timeout);
+    if (result == WAIT_OBJECT_0) return true;
+    if (result != WAIT_TIMEOUT) throw windows_error("Could not wait for Optic to close");
+    throw std::runtime_error("Timed out waiting for Optic to finish its saved clip and close; the process was left running");
+}
+
+class MutexLease {
+public:
+    explicit MutexLease(const wchar_t* name) : handle_(CreateMutexW(nullptr, FALSE, name)) {
+        if (!handle_.get()) throw windows_error("Could not open the Optic launch lock");
+    }
+    ~MutexLease() { release(); }
+    bool acquire() {
+        const DWORD result = WaitForSingleObject(handle_.get(), 0);
+        if (result == WAIT_TIMEOUT) return false;
+        if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) throw windows_error("Could not lock the Optic launch");
+        owned_ = true;
+        return true;
+    }
+    void release() noexcept {
+        if (owned_) {
+            ReleaseMutex(handle_.get());
+            owned_ = false;
+        }
+    }
+    void hold_until_process_exit() noexcept {
+        // The running app intentionally hands this one kernel handle to the
+        // process. Windows closes it on exit and abandons the owning thread's
+        // mutex. A tray/window teardown is too early: COM and Rust may still
+        // be unwinding while the executable image remains in use.
+        owned_ = false;
+        (void)handle_.release();
+    }
+private:
+    Handle handle_;
+    bool owned_ = false;
 };
 
 std::wstring from_utf8(const char* text) {
@@ -261,7 +374,7 @@ public:
         if (icon_) DestroyIcon(icon_);
     }
 
-    bool initialize() {
+    bool initialize(const std::wstring& identity) {
         const HINSTANCE instance = GetModuleHandleW(nullptr);
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = window_proc;
@@ -273,9 +386,11 @@ public:
         }
         taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
         if (!taskbar_created_) return false;
+        shutdown_message_ = RegisterWindowMessageW(kShutdownMessageName);
+        if (!shutdown_message_) return false;
         // An ordinary hidden top-level window receives Explorer/display/power
         // broadcasts. A message-only window would miss those notifications.
-        window_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"Optic", WS_POPUP,
+        window_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, identity.c_str(), WS_POPUP,
             0, 0, 0, 0, nullptr, nullptr, instance, this);
         if (!window_) return false;
         {
@@ -317,6 +432,7 @@ private:
     HWND window_ = nullptr;
     HICON icon_ = nullptr;
     UINT taskbar_created_ = 0;
+    UINT shutdown_message_ = 0;
     std::int32_t state_ = 0;
     std::wstring message_ = L"Stopped";
     std::vector<std::wstring> shortcut_failures_;
@@ -329,6 +445,8 @@ private:
     bool session_notifications_ = false;
     bool quitting_ = false;
     bool awaiting_termination_ = false;
+    bool session_ending_ = false;
+    bool shutdown_blocked_ = false;
     bool menu_open_ = false;
     HMENU active_menu_ = nullptr;
     HWND menu_window_ = nullptr;
@@ -354,8 +472,8 @@ private:
         };
         update(0, true, status_text.c_str(), false);
         update(kToggleCommand, false, toggle_title(),
-            !quitting_ && (state_ == 0 || state_ == 1 || state_ == 2));
-        update(kSaveCommand, false, nullptr, !quitting_ && state_ == 2);
+            !quitting_ && !session_ending_ && (state_ == 0 || state_ == 1 || state_ == 2));
+        update(kSaveCommand, false, nullptr, !quitting_ && !session_ending_ && state_ == 2);
         update(kQuitCommand, false, nullptr, !quitting_);
         DrawMenuBar(window_);
         // WM_ENTERIDLE supplies the current popup's HWND. Invalidate it as
@@ -426,13 +544,17 @@ private:
 
     void set_status(const Status& status) {
         if (quitting_) return;
+        if (shutdown_blocked_ && callback_(4)) {
+            ShutdownBlockReasonDestroy(window_);
+            shutdown_blocked_ = false;
+        }
         state_ = status.state;
         message_ = status.message.empty() ? state_name(state_) : status.message;
         update_icon();
     }
 
     void toggle() {
-        if (quitting_ || (state_ != 0 && state_ != 1 && state_ != 2)) return;
+        if (quitting_ || session_ending_ || (state_ != 0 && state_ != 1 && state_ != 2)) return;
         state_ = state_ == 0 ? 1 : 3;
         message_ = state_name(state_);
         update_icon();
@@ -440,7 +562,7 @@ private:
     }
 
     void save() {
-        if (!quitting_ && state_ == 2) callback_(2);
+        if (!quitting_ && !session_ending_ && state_ == 2) callback_(2);
     }
 
     void quit() {
@@ -453,6 +575,29 @@ private:
             message_ = L"Finishing saved clip\x2026";
             update_icon();
         }
+    }
+
+    bool query_end_session() {
+        // A query may be canceled by another app. Do not clear the replay
+        // buffer or request quit until Windows commits with WM_ENDSESSION.
+        if (awaiting_termination_ || !callback_(4)) {
+            shutdown_blocked_ = ShutdownBlockReasonCreate(window_,
+                L"Optic is finishing a saved clip.") != FALSE;
+            return false;
+        }
+        session_ending_ = true;
+        refresh_menu();
+        return true;
+    }
+
+    void end_session(bool ending) {
+        if (shutdown_blocked_) {
+            ShutdownBlockReasonDestroy(window_);
+            shutdown_blocked_ = false;
+        }
+        session_ending_ = false;
+        if (ending) quit();
+        else refresh_menu();
     }
 
     void open_folder() {
@@ -493,9 +638,9 @@ private:
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, failure.c_str());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        const bool can_toggle = !quitting_ && (state_ == 0 || state_ == 1 || state_ == 2);
+        const bool can_toggle = !quitting_ && !session_ending_ && (state_ == 0 || state_ == 1 || state_ == 2);
         AppendMenuW(menu, MF_STRING | (can_toggle ? MF_ENABLED : MF_DISABLED), kToggleCommand, toggle_title());
-        AppendMenuW(menu, MF_STRING | (!quitting_ && state_ == 2 ? MF_ENABLED : MF_DISABLED),
+        AppendMenuW(menu, MF_STRING | (!quitting_ && !session_ending_ && state_ == 2 ? MF_ENABLED : MF_DISABLED),
             kSaveCommand, L"Save Replay\tCtrl+Alt+S");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kFolderCommand, L"Open Recordings Folder");
@@ -536,6 +681,7 @@ private:
     }
 
     void destroy() noexcept {
+        if (shutdown_blocked_) ShutdownBlockReasonDestroy(window_);
         if (active_menu_) EndMenu();
         {
             std::lock_guard<std::mutex> guard(window_mutex);
@@ -572,6 +718,10 @@ private:
         }
         if (!app) return DefWindowProcW(window, message, wparam, lparam);
         try {
+            if (app->shutdown_message_ && message == app->shutdown_message_) {
+                app->quit();
+                return 0;
+            }
             if (app->taskbar_created_ && message == app->taskbar_created_) {
                 app->tray_added_ = false;
                 app->update_icon();
@@ -629,10 +779,9 @@ private:
                     app->quit();
                     return 0;
                 case WM_QUERYENDSESSION:
-                    app->quit();
-                    return app->awaiting_termination_ ? FALSE : TRUE;
+                    return app->query_end_session() ? TRUE : FALSE;
                 case WM_ENDSESSION:
-                    if (wparam) app->quit();
+                    app->end_session(wparam != FALSE);
                     return 0;
                 case WM_POWERBROADCAST:
                     if (wparam == PBT_APMSUSPEND) optic_capture_interrupt();
@@ -721,14 +870,28 @@ extern "C" void optic_run(ActionCallback callback) {
     try {
         if (FAILED(com)) throw std::runtime_error("Could not initialize the tray COM apartment (HRESULT "
             + std::to_string(static_cast<unsigned long>(com)) + ")");
-        Application application(callback);
-        if (application.initialize()) {
-            application.run();
+        // Setup/uninstall keeps this lease throughout executable replacement.
+        // Take it before the instance lock so a launch cannot race shutdown.
+        MutexLease maintenance(kMaintenanceMutex);
+        const bool can_launch = maintenance.acquire();
+        const auto identity = instance_name();
+        MutexLease instance(identity.c_str());
+        if (!can_launch) {
+            write_diagnostic(L"Installation or removal is in progress; try launching Optic again when it finishes.");
+        } else if (!instance.acquire()) {
+            write_diagnostic(L"Optic is already running in this Windows session.");
         } else {
-            const std::wstring message = L"Could not start the Optic tray (error "
-                + std::to_wstring(GetLastError()) + L")";
-            report_error("ui", "tray.initialization_failed", message);
-            MessageBoxW(nullptr, message.c_str(), L"Optic", MB_OK | MB_ICONERROR);
+            Application application(callback);
+            if (application.initialize(identity)) {
+                maintenance.release();
+                instance.hold_until_process_exit();
+                application.run();
+            } else {
+                const std::wstring message = L"Could not start the Optic tray (error "
+                    + std::to_wstring(GetLastError()) + L")";
+                report_error("ui", "tray.initialization_failed", message);
+                MessageBoxW(nullptr, message.c_str(), L"Optic", MB_OK | MB_ICONERROR);
+            }
         }
     } catch (const std::exception& error) {
         report_error("ui", "tray.initialization_failed", L"Could not start the Optic tray: " + from_utf8(error.what()));
@@ -740,6 +903,63 @@ extern "C" void optic_run(ActionCallback callback) {
 
 extern "C" void optic_set_error_callback(ErrorCallback callback) {
     error_callback.store(callback);
+}
+
+extern "C" bool optic_shutdown(std::uint32_t timeout_ms, char* error, std::size_t error_capacity) {
+    optic::copy_error("", error, error_capacity);
+    try {
+        if (!timeout_ms || timeout_ms > 600000) throw std::runtime_error("Shutdown timeout must be between 1 and 600000 milliseconds");
+        const auto identity = instance_name();
+        const auto sid = user_sid(GetCurrentProcess());
+        Handle instance(OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, identity.c_str()));
+        if (!instance.get()) {
+            if (GetLastError() != ERROR_FILE_NOT_FOUND) throw windows_error("Could not contact the running Optic instance");
+        }
+        const ULONGLONG started = GetTickCount64();
+        auto remaining = [started, timeout_ms]() {
+            const ULONGLONG elapsed = GetTickCount64() - started;
+            return elapsed >= timeout_ms ? DWORD{0} : static_cast<DWORD>(timeout_ms - elapsed);
+        };
+        DWORD own_session = 0;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &own_session)) throw windows_error("Could not identify this Windows session");
+        const UINT shutdown_message = RegisterWindowMessageW(kShutdownMessageName);
+        if (!shutdown_message) throw windows_error("Could not prepare the Optic shutdown request");
+        while (instance.get()) {
+            const DWORD lock_result = WaitForSingleObject(instance.get(), 0);
+            if (lock_result == WAIT_OBJECT_0 || lock_result == WAIT_ABANDONED) {
+                ReleaseMutex(instance.get());
+                break;
+            }
+            if (lock_result != WAIT_TIMEOUT) throw windows_error("Could not check the running Optic instance");
+            const HWND window = FindWindowW(kWindowClass, identity.c_str());
+            if (window) {
+                if (!shutdown_window(window, shutdown_message, sid, own_session, remaining())) {
+                    throw std::runtime_error("The Optic shutdown endpoint belongs to another user or session");
+                }
+                break;
+            }
+            // A launch holds the instance lock before publishing its window.
+            // Cover that interval without treating a still-starting app as absent.
+            const DWORD budget = remaining();
+            if (!budget) throw std::runtime_error("Timed out waiting for the running Optic instance to respond; the process was left running");
+            Sleep(std::min(DWORD{25}, budget));
+        }
+        // Portable releases before this protocol have no instance mutex. They
+        // still publish the old tray class/title and already defer WM_CLOSE
+        // until a pending save completes. Close every such instance for this
+        // user before the installer replaces or launches the app.
+        HWND previous = nullptr;
+        while (const HWND legacy = FindWindowExW(nullptr, previous, kWindowClass, kLegacyWindowTitle)) {
+            const bool closed = shutdown_window(legacy, WM_CLOSE, sid, own_session, remaining());
+            previous = closed ? nullptr : legacy;
+        }
+        return true;
+    } catch (const std::exception& exception) {
+        optic::copy_error(exception.what(), error, error_capacity);
+    } catch (...) {
+        optic::copy_error("Could not shut down Optic", error, error_capacity);
+    }
+    return false;
 }
 
 extern "C" void optic_set_status(std::int32_t state, const char* message) {

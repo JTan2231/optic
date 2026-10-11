@@ -47,6 +47,8 @@ unsafe extern "C" {
     ) -> bool;
     #[cfg(target_os = "windows")]
     fn optic_prepare_console();
+    #[cfg(target_os = "windows")]
+    fn optic_shutdown(timeout_ms: u32, error: *mut c_char, error_capacity: usize) -> bool;
     pub fn optic_generate_test_video(
         generation: u64,
         frame: FrameCallback,
@@ -106,6 +108,18 @@ pub fn prepare_console() {
     unsafe {
         optic_prepare_console();
     };
+}
+
+#[cfg(target_os = "windows")]
+pub fn shutdown(timeout_ms: u32) -> Result<(), String> {
+    let mut error = [0; 2048];
+    // SAFETY: The bridge copies its error into this writable buffer and retains
+    // no references. It asks only this user's session instance to finish saving.
+    if unsafe { optic_shutdown(timeout_ms, error.as_mut_ptr(), error.len()) } {
+        Ok(())
+    } else {
+        Err(bridge_error(&error))
+    }
 }
 
 fn bridge_error(error: &[c_char]) -> String {

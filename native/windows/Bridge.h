@@ -7,6 +7,8 @@
 #include <string>
 
 using ActionCallback = bool(__cdecl*)(std::int32_t);
+// Actions: 1 toggle, 2 save, 3 quit (false defers termination), 4 query whether
+// session shutdown is currently safe (false while a clip is saving).
 using FrameCallback = void(__cdecl*)(std::uint64_t, void*, double, double, std::size_t, bool);
 using EventCallback = void(__cdecl*)(std::uint64_t, std::int32_t, const char*);
 // Events: 1 started, 2 stopped, 3 failed, 4 interrupted by the session/display.
@@ -18,6 +20,7 @@ void optic_run(ActionCallback callback);
 void optic_set_status(std::int32_t state, const char* message);
 void optic_finish_quit();
 void optic_prepare_console();
+bool optic_shutdown(std::uint32_t timeout_ms, char* error, std::size_t error_capacity);
 bool optic_recordings_folder(wchar_t* path, std::size_t capacity, char* error, std::size_t error_capacity);
 void optic_capture_start(std::uint64_t generation, FrameCallback frame, EventCallback event);
 void optic_capture_stop(std::uint64_t generation);

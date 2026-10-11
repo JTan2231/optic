@@ -12,12 +12,15 @@ Runs validation without changing source files.
 Fails on other platforms rather than accepting Rust-only coverage.
 .PARAMETER RequireWindows
 Requires full Windows native app coverage on a Windows x64 runner.
+.PARAMETER RequireInstaller
+Requires Inno Setup and checks the Windows installer compilation.
 #>
 [CmdletBinding()]
 param(
     [switch] $CheckOnly,
     [switch] $RequireMacOS,
-    [switch] $RequireWindows
+    [switch] $RequireWindows,
+    [switch] $RequireInstaller
 )
 
 Set-StrictMode -Version Latest
@@ -240,6 +243,27 @@ try {
                 -Arguments @('--self-test', $packagedClip)
             Invoke-CiCommand -Name 'windows-package-decode' -Phase 'Check' `
                 -FilePath (Join-Path $env:OPTIC_NATIVE_TESTS_DIR 'media.exe') -Arguments @('--verify', $packagedClip)
+            $compiler = Get-Command ISCC.exe -CommandType Application -ErrorAction SilentlyContinue
+            $compilerCandidates = @(
+                $env:OPTIC_ISCC,
+                (Join-Path $repositoryRoot 'target/tools/inno-setup/ISCC.exe'),
+                (Join-Path $env:LOCALAPPDATA 'Programs/Inno Setup 7/ISCC.exe'),
+                (Join-Path $env:LOCALAPPDATA 'Programs/Inno Setup 6/ISCC.exe'),
+                (Join-Path $env:ProgramFiles 'Inno Setup 7/ISCC.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7/ISCC.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+            )
+            $hasInstallerCompiler = $compiler -or @($compilerCandidates | Where-Object {
+                $_ -and (Test-Path -LiteralPath $_ -PathType Leaf)
+            }).Count -gt 0
+            if ($RequireInstaller -or $hasInstallerCompiler) {
+                Invoke-CiCommand -Name 'windows-installer' -Phase 'Check' -FilePath (Get-Process -Id $PID).Path `
+                    -Arguments @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'build-installer.ps1'), '-SkipAppBuild')
+            }
+            else {
+                Add-CiResult -Name 'windows-installer' -Phase 'Coverage' -Status 'Skipped' -ExitCode 0 -Log '' `
+                    -Detail 'Install Inno Setup 6.4+ or set OPTIC_ISCC; -RequireInstaller makes this gap a failure.'
+            }
         }
     }
     else {
@@ -248,6 +272,10 @@ try {
         $detail = 'Windows app and media checks require a Windows x64 runner with Visual Studio C++ Build Tools and the Windows SDK.'
         Add-CiResult -Name 'windows-app-checks' -Phase 'Coverage' -Status $status -ExitCode $code -Log '' -Detail $detail
         Write-Host "`n$status`: $detail"
+        if ($RequireInstaller) {
+            Add-CiResult -Name 'windows-installer' -Phase 'Coverage' -Status 'Failed' -ExitCode 1 -Log '' `
+                -Detail 'Windows installer checks require a Windows runner with Inno Setup.'
+        }
     }
 }
 catch {

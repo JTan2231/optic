@@ -89,6 +89,10 @@ extern "C" fn action(action: i32) -> bool {
             unsafe { native::optic_capture_stop(generation) };
             return finish_now;
         }
+        // Windows end-session queries must not initiate irreversible cleanup;
+        // another application's response can still cancel the session shutdown.
+        #[cfg(target_os = "windows")]
+        4 => return !recorder().saving,
         _ => (),
     }
     true
@@ -381,6 +385,27 @@ pub fn run() {
         std::process::exit(2);
     }
     match first.as_deref().and_then(|s| s.to_str()) {
+        #[cfg(target_os = "windows")]
+        Some("--shutdown") => {
+            let timeout_seconds = args.next().map_or(120, |value| {
+                let Some(value @ 1..=600) =
+                    value.to_str().and_then(|value| value.parse::<u32>().ok())
+                else {
+                    eprintln!("Shutdown timeout must be an integer from 1 to 600 seconds.");
+                    std::process::exit(2);
+                };
+                value
+            });
+            if args.next().is_some() {
+                eprintln!("Use --shutdown [timeout-seconds].");
+                std::process::exit(2);
+            }
+            if let Err(error) = native::shutdown(timeout_seconds * 1000) {
+                logging::error("cli", "shutdown.failed", &error, None);
+                eprintln!("Optic shutdown failed: {error}");
+                std::process::exit(1);
+            }
+        }
         Some("--self-test") => {
             let path = args.next().map_or_else(
                 || std::env::temp_dir().join("optic-self-test.mp4"),
@@ -408,6 +433,8 @@ pub fn run() {
                 "your Videos folder/Optic",
             );
             println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video to {folder}\n\n--self-test [path.mp4]  Verify encoding, buffering, and export without capturing your screen");
+            #[cfg(target_os = "windows")]
+            println!("--shutdown [seconds]  Finish any active save and close this session's Optic instance (default 120, maximum 600)");
         }
         Some(_) => {
             eprintln!("Unknown argument. Use --help for options.");
