@@ -1,7 +1,7 @@
 # Optic
 
-A macOS menu bar and Windows tray app that saves recent screen video with a
-shortcut. Rust owns the recording state, bounded replay buffer, save jobs, and
+A macOS menu bar and Windows tray app that saves recent screen video and
+playback audio with a shortcut. Rust owns the recording state, replay buffer, save jobs, and
 the complete Windows tray, capture, and media backend. Windows APIs use
 Microsoft's `windows` Rust bindings. A Swift bridge uses Apple's screen/media
 frameworks on macOS.
@@ -103,23 +103,40 @@ starting, the clip contains the history available so far. Stopping does not
 cancel a save that you already requested, and starting again creates fresh
 history.
 
+On Windows, brief capture interruptions such as Alt-Tab out of a fullscreen app
+recover automatically. Optic repeats the last good image for up to five seconds
+while rebuilding capture, so a saved clip may briefly freeze before motion resumes.
+The encoder, replay history, and Save action stay available. If the screen remains
+unavailable, Optic shows **Screen capture unavailable · retrying** and preserves
+the buffered footage while it continues trying. Time after the frozen-frame grace
+period is omitted from the clip when capture resumes. A display resolution change
+keeps the clip's original dimensions and fits the new image inside them.
+
 On the first start, macOS may request Screen Recording permission. Allow Optic
 in **System Settings → Privacy & Security → Screen Recording** (called
 **Screen & System Audio Recording** on some versions), then quit and reopen
-the app if macOS requires it. No microphone is used. Capture only starts when
-you choose Start Buffering or press its shortcut.
+the app if macOS requires it. Optic captures system playback audio; no microphone
+is used. Capture only starts when you choose Start Buffering or press its shortcut.
 
 ## First version
 
 - Captures the primary display, including the cursor.
 - Keeps approximately the last 30 seconds in memory. Clips may include up to
   one additional keyframe interval, about a second, so they start cleanly.
-- Video only: H.264 in MP4, 30 fps, up to 1080 pixels high, about 8 Mbps.
-- Compressed history has a strict 64 MiB payload limit. High bitrate content
+- H.264 video in MP4, capped at 60 fps, up to 1080 pixels high, about 8 Mbps.
+  Capture is best effort: missed frames are skipped and elapsed time is preserved.
+- Records the combined audio playing through the current speakers or headphones,
+  using stereo 48 kHz AAC in saved clips. Microphone audio is not captured.
+  Audio is buffered as PCM and encoded when saving; clips remain available if
+  audio capture is unavailable. Windows retries unavailable or changed output devices.
+- Compressed video history has a strict 64 MiB payload limit. High bitrate content
   may shorten the retained duration; native frame queues and a save in progress
-  also use memory.
-- Stops and clears history on capture failure or interruption. Sleep, screen
-  locking, and display changes may require starting buffering again.
+  also use memory. Playback audio has a separate time-bounded history.
+- Windows recovers from transient capture and display interruptions while keeping
+  replay history. Audio follows the same frozen-frame grace and omitted outage
+  timeline as video. Sleep and screen locking stop capture and clear history;
+  choose Start Buffering again afterward. Unrecoverable capture/encoding failures
+  and macOS capture interruptions also stop and clear history.
 - Processes one save at a time. The Windows installer can enable launch at sign-in;
   macOS has no launch-at-login setting yet.
 
@@ -132,10 +149,13 @@ menu actions still work.
 ## Error logs
 
 Optic records capture, encoding, saving, shortcut, tray, and command-line
-operation failures in local UTF-8 text logs. Normal recording statuses,
-successful operations, duplicate launches, and known sleep/lock/display
-interruptions create no entries. The tray still displays recording status and
-interruptions.
+operation failures in local UTF-8 text logs. Audio capture failures are nonfatal
+and logged while video continues. Unexpected Windows capture and
+display interruptions record their cause and native error code when available.
+Recovery and prolonged unavailability are logged once per interruption, without
+logging each retry. Normal recording statuses, successful operations,
+duplicate launches, and known sleep/lock/session interruptions create no entries.
+The tray still displays recording status and interruptions.
 
 Logs are stored in `%LOCALAPPDATA%\Optic\Logs` on Windows and
 `~/Library/Logs/Optic` on macOS. Each process creates its own `optic-*` session
@@ -176,7 +196,8 @@ require the native build tools described above. macOS lint checks require
 Xcode 16 or newer with `swift-format`. Windows runs validate the Rust backend,
 test the real media pipeline, and build the packaged app.
 Rust tests cover cursor composition/rotation/scaling, tray menu states and
-deferred quitting, complete MP4 decoding, keyframe trimming, Unicode paths,
+deferred quitting, complete MP4 decoding, synchronized audio/video export,
+keyframe trimming, Unicode paths,
 and export failure cleanup. The synthetic checks do not capture your screen.
 Windows lifecycle tests also cover launches from different paths, maintenance
 locking, graceful process shutdown and timeout, and canceled session shutdown.
@@ -221,8 +242,9 @@ cargo run -- --self-test target/optic-self-test.mp4
 The unit tests check buffer timing, keyframe boundaries, memory bounds, and
 sample release. The media self-test creates synthetic moving frames, encodes
 them through the platform H.264 encoder, trims them through the Rust replay
-buffer, and writes a finalized MP4 without re-encoding. It does not capture
-your screen or require Screen Recording permission.
+buffer, generates synthetic playback audio with tone and silence, and writes a
+finalized MP4 with remuxed video and AAC audio. It does not capture your screen
+or playback device, or require Screen Recording permission.
 
 For actual capture, start buffering, wait a few seconds, save, and open the
 result. Stop, start again, and save shortly afterward to confirm the old
@@ -235,15 +257,21 @@ They check capture, saving while buffering, retained snapshots after stopping,
 restart, interruption, and rapid cancellation. They record the primary display;
 CI's default synthetic tests do not invoke them.
 
+To verify Windows playback-device capture, run
+`cargo test windows::audio::tests::live_loopback_captures_playback_tone -- --ignored --exact --nocapture`.
+This briefly plays a quiet synthetic tone through the default speakers/headphones
+and verifies the captured PCM in memory; it does not capture the screen or save audio.
+
 ## Source
 
 - `src/app.rs`: start/stop lifecycle, native callbacks, save jobs.
 - `src/logging.rs`: error records, bounded per-process logs, retention, and panic diagnostics.
-- `src/buffer.rs`: bounded compressed history and independent save snapshots.
+- `src/buffer.rs`: compressed video and PCM audio history, independent save snapshots.
 - `native/Media.swift`: capture, encoding, and finalized MP4 export.
 - `native/App.swift`: menu bar and global shortcuts.
 - `src/windows/app.rs`: tray menu, global shortcuts, Videos folder lookup, and maintenance lifecycle.
 - `src/windows/capture.rs`: Desktop Duplication and capture lifecycle.
+- `src/windows/audio.rs`: WASAPI system playback capture and output-device recovery.
 - `src/windows/pixels.rs`: cursor composition, rotation, and scaling.
 - `src/windows/media.rs`: Media Foundation H.264 encoding, immutable samples, and MP4 export.
 - `src/native.rs`: safe platform facade and macOS-only foreign-language bridge.
@@ -257,9 +285,10 @@ may require refreshing its recording authorization. Distributing it to other
 people would require Developer ID signing and notarization.
 
 Windows builds target x64. The Rust Windows backend uses Desktop Duplication to
-capture the primary display directly, with no capture picker. Locking,
-suspending, or changing displays interrupts capture and clears history;
-choose Start Buffering again when the display is available. Windows N editions
+capture the primary display directly, with no capture picker. Display transitions
+rebuild capture automatically and preserve history. Locking and suspending
+interrupt capture and clear history; choose Start Buffering again when the
+display is available. Windows N editions
 need Microsoft's Media Feature Pack for Media Foundation support.
 
 ## License

@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ScreenCaptureKit",
         "VideoToolbox",
         "AVFoundation",
+        "AudioToolbox",
         "CoreMedia",
         "CoreVideo",
         "Foundation",

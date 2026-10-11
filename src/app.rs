@@ -1,7 +1,7 @@
 use crate::{
-    buffer::{Frame, ReplayBuffer},
+    buffer::{AudioBuffer, AudioFrame, Frame, ReplayBuffer},
     logging,
-    native::{self, Sample},
+    native::{self, AudioSample, Sample},
 };
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_void, CStr};
@@ -20,6 +20,8 @@ enum Phase {
     Starting = 1,
     Buffering = 2,
     Stopping = 3,
+    Recovering = 4,
+    Unavailable = 5,
 }
 
 impl Phase {
@@ -27,8 +29,24 @@ impl Phase {
         match self {
             Self::Stopped => 0,
             Self::Starting => 1,
-            Self::Buffering => 2,
+            Self::Buffering | Self::Recovering | Self::Unavailable => 2,
             Self::Stopping => 3,
+        }
+    }
+
+    const fn can_save(self) -> bool {
+        matches!(self, Self::Buffering | Self::Recovering | Self::Unavailable)
+    }
+
+    const fn accepts_frames(self) -> bool {
+        matches!(self, Self::Starting) || self.can_save()
+    }
+
+    fn save_status(self, message: &str) -> String {
+        match self {
+            Self::Recovering => format!("Recovering screen capture · {message}"),
+            Self::Unavailable => format!("Screen capture unavailable · retrying · {message}"),
+            _ => message.to_owned(),
         }
     }
 }
@@ -37,6 +55,7 @@ struct Recorder {
     phase: Phase,
     generation: u64,
     buffer: ReplayBuffer<Arc<Sample>>,
+    audio: AudioBuffer<Arc<AudioSample>>,
     saving: bool,
     shutdown: bool,
 }
@@ -47,6 +66,8 @@ impl Recorder {
             phase: Phase::Stopped,
             generation: 0,
             buffer: ReplayBuffer::new(BUFFER_SECONDS, BUFFER_BYTES),
+            // Include the preceding video keyframe and a little callback latency.
+            audio: AudioBuffer::new(BUFFER_SECONDS + 2.0),
             saving: false,
             shutdown: false,
         }
@@ -76,6 +97,7 @@ fn action(action: i32) -> bool {
             let mut state = recorder();
             state.shutdown = true;
             state.buffer.clear();
+            state.audio.clear();
             let generation = state.generation;
             state.phase = Phase::Stopped;
             let finish_now = !state.saving;
@@ -101,15 +123,17 @@ fn toggle() {
         Phase::Stopped => {
             state.generation += 1;
             state.buffer.clear();
+            state.audio.clear();
             state.phase = Phase::Starting;
             let generation = state.generation;
             publish(Phase::Starting, "Starting screen capture…");
             drop(state);
-            native::capture_start(generation, frame_received, capture_event);
+            native::capture_start(generation, frame_received, audio_received, capture_event);
         }
-        Phase::Starting | Phase::Buffering => {
+        Phase::Starting | Phase::Buffering | Phase::Recovering | Phase::Unavailable => {
             // Clear immediately, before asynchronous capture shutdown finishes.
             state.buffer.clear();
+            state.audio.clear();
             state.phase = Phase::Stopping;
             let generation = state.generation;
             publish(Phase::Stopping, "Stopping · buffer cleared");
@@ -167,13 +191,57 @@ fn frame_from_sample(sample: Sample) -> Frame<Arc<Sample>> {
 
 fn receive_frame(generation: u64, frame: Frame<Arc<Sample>>) {
     let mut state = recorder();
-    if !state.shutdown
-        && generation == state.generation
-        && matches!(state.phase, Phase::Starting | Phase::Buffering)
-    {
+    if !state.shutdown && generation == state.generation && state.phase.accepts_frames() {
         state.buffer.push(frame);
     }
     // Unaccepted frames release their transferred reference here as well.
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn audio_received(
+    generation: u64,
+    sample: *mut c_void,
+    pts: f64,
+    duration: f64,
+    size: usize,
+) {
+    if sample.is_null() {
+        return;
+    }
+    // SAFETY: Swift transfers one retained immutable PCM sample reference.
+    let sample = unsafe { AudioSample::from_retained(sample) };
+    receive_audio(
+        generation,
+        AudioFrame {
+            sample: Arc::new(sample),
+            pts,
+            duration,
+            size,
+        },
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "100 ns timestamps fit exact f64 integers for normal capture durations"
+)]
+fn audio_received(generation: u64, sample: AudioSample) {
+    let packet = AudioFrame {
+        pts: sample.pts as f64 / 10_000_000.0,
+        duration: sample.duration as f64 / 10_000_000.0,
+        size: sample.bytes.len(),
+        sample: Arc::new(sample),
+    };
+    receive_audio(generation, packet);
+}
+
+fn receive_audio(generation: u64, packet: AudioFrame<Arc<AudioSample>>) {
+    let mut state = recorder();
+    if !state.shutdown && generation == state.generation && state.phase.accepts_frames() {
+        state.audio.push(packet);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,9 +270,10 @@ fn handle_capture_event(generation: u64, event: i32, message: &str) {
     }
     // Terminal callbacks can race cancellation or arrive twice. Only the
     // active capture can fail; old/canceled work must not create error noise.
-    if matches!(event, 3 | 4) && !matches!(state.phase, Phase::Starting | Phase::Buffering) {
+    if matches!(event, 3..=5 | 9) && !state.phase.accepts_frames() {
         return;
     }
+    let mut log_event = None;
     let output = match event {
         1 if state.phase == Phase::Starting => {
             state.phase = Phase::Buffering;
@@ -213,17 +282,59 @@ fn handle_capture_event(generation: u64, event: i32, message: &str) {
         2 => {
             state.phase = Phase::Stopped;
             state.buffer.clear();
+            state.audio.clear();
             Some((Phase::Stopped, "Stopped · buffer empty".to_owned()))
         }
         3 => {
             state.phase = Phase::Stopped;
             state.buffer.clear();
+            state.audio.clear();
+            log_event = Some("capture.failed");
             Some((Phase::Stopped, format!("Capture failed: {message}")))
         }
-        4 => {
+        4 | 5 => {
             state.phase = Phase::Stopped;
             state.buffer.clear();
+            state.audio.clear();
+            if event == 5 {
+                log_event = Some("capture.interrupted");
+            }
             Some((Phase::Stopped, message.to_owned()))
+        }
+        6 if matches!(state.phase, Phase::Starting | Phase::Buffering) => {
+            state.phase = Phase::Recovering;
+            log_event = Some("capture.recovering");
+            let status = if state.saving {
+                Phase::Recovering.save_status("saving clip…")
+            } else {
+                "Recovering screen capture…".to_owned()
+            };
+            Some((Phase::Recovering, status))
+        }
+        7 if matches!(state.phase, Phase::Recovering | Phase::Unavailable) => {
+            state.phase = Phase::Buffering;
+            let status = if state.saving {
+                "Buffering · saving clip…"
+            } else {
+                "Buffering · last 30 seconds"
+            };
+            Some((Phase::Buffering, status.to_owned()))
+        }
+        8 if state.phase == Phase::Recovering => {
+            state.phase = Phase::Unavailable;
+            log_event = Some("capture.unavailable");
+            let status = if state.saving {
+                Phase::Unavailable.save_status("saving clip…")
+            } else {
+                "Screen capture unavailable · retrying…".to_owned()
+            };
+            Some((Phase::Unavailable, status))
+        }
+        9 => {
+            // Audio is best effort: preserve video, recovery state, and saves.
+            drop(state);
+            logging::error("audio", "audio.capture_failed", message, Some(generation));
+            return;
         }
         _ => None,
     };
@@ -231,8 +342,8 @@ fn handle_capture_event(generation: u64, event: i32, message: &str) {
         publish(phase, &message);
     }
     drop(state);
-    if event == 3 {
-        logging::error("capture", "capture.failed", message, Some(generation));
+    if let Some(event) = log_event {
+        logging::error("capture", event, message, Some(generation));
     }
 }
 
@@ -250,43 +361,63 @@ fn recording_path() -> Result<PathBuf, String> {
     )))
 }
 
-fn export(frames: &[Frame<Arc<Sample>>], path: &Path) -> Result<(), String> {
+fn export(
+    frames: &[Frame<Arc<Sample>>],
+    audio: &[AudioFrame<Arc<AudioSample>>],
+    path: &Path,
+) -> Result<(), String> {
     if frames.is_empty() || !frames[0].keyframe {
         return Err("No decodable video buffered yet".into());
     }
     let samples: Vec<&Sample> = frames.iter().map(|frame| frame.sample.as_ref()).collect();
-    native::export_samples(&samples, path)
+    let audio: Vec<&AudioSample> = audio.iter().map(|packet| packet.sample.as_ref()).collect();
+    native::export_samples(&samples, &audio, path)
 }
 
 fn save() {
     let mut state = recorder();
-    if state.shutdown || state.phase != Phase::Buffering {
+    if state.shutdown || !state.phase.can_save() {
         return;
     }
+    let phase = state.phase;
     if state.saving {
-        publish(Phase::Buffering, "A clip is already saving…");
+        publish(phase, &phase.save_status("A clip is already saving…"));
         return;
     }
     let frames = state.buffer.snapshot();
     if frames.is_empty() {
-        publish(Phase::Buffering, "Waiting for the first video frame…");
+        publish(
+            phase,
+            &phase.save_status("Waiting for the first video frame…"),
+        );
         return;
     }
+    // Both snapshots share the recorder lock; the exporter crops edge packets.
+    let audio = state.audio.snapshot_between(
+        frames[0].pts,
+        frames
+            .last()
+            .map_or(frames[0].pts, |frame| frame.pts + frame.duration),
+    );
     state.saving = true;
     let duration = state.buffer.duration();
     let generation = state.generation;
-    publish(Phase::Buffering, &format!("Saving {duration:.1} seconds…"));
+    publish(
+        phase,
+        &phase.save_status(&format!("Saving {duration:.1} seconds…")),
+    );
     drop(state);
     let worker = std::thread::Builder::new()
         .name("optic-save".into())
         .spawn(move || {
             let result = recording_path().and_then(|path| {
-                export(&frames, &path)?;
+                export(&frames, &audio, &path)?;
                 Ok(path)
             });
             // Drop the snapshot before announcing completion. A stopped buffer
             // remains empty; an already requested save owns its own references.
             drop(frames);
+            drop(audio);
             finish_save(result, generation);
         });
     if let Err(error) = worker {
@@ -312,12 +443,16 @@ fn finish_save(result: Result<PathBuf, String>, generation: u64) {
         return;
     }
     match result {
-        Ok(path) => publish(phase, &format!("Saved {}", path.display())),
-        Err(error) => publish(phase, &format!("Save failed: {error}")),
+        Ok(path) => publish(
+            phase,
+            &phase.save_status(&format!("Saved {}", path.display())),
+        ),
+        Err(error) => publish(phase, &phase.save_status(&format!("Save failed: {error}"))),
     }
 }
 
 static TEST_BUFFER: OnceLock<Mutex<ReplayBuffer<Arc<Sample>>>> = OnceLock::new();
+static TEST_AUDIO: OnceLock<Mutex<AudioBuffer<Arc<AudioSample>>>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 extern "C" fn test_frame(
@@ -357,11 +492,60 @@ fn receive_test_frame(frame: Frame<Arc<Sample>>) {
     }
 }
 
+#[cfg(target_os = "macos")]
+extern "C" fn test_audio(
+    _generation: u64,
+    sample: *mut c_void,
+    pts: f64,
+    duration: f64,
+    size: usize,
+) {
+    if sample.is_null() {
+        return;
+    }
+    // SAFETY: The Swift generator transfers one retained immutable PCM sample.
+    let sample = unsafe { AudioSample::from_retained(sample) };
+    receive_test_audio(AudioFrame {
+        sample: Arc::new(sample),
+        pts,
+        duration,
+        size,
+    });
+}
+
+#[cfg(target_os = "windows")]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "100 ns timestamps fit exact f64 integers for synthetic clip durations"
+)]
+fn test_audio(_generation: u64, sample: AudioSample) {
+    receive_test_audio(AudioFrame {
+        pts: sample.pts as f64 / 10_000_000.0,
+        duration: sample.duration as f64 / 10_000_000.0,
+        size: sample.bytes.len(),
+        sample: Arc::new(sample),
+    });
+}
+
+fn receive_test_audio(packet: AudioFrame<Arc<AudioSample>>) {
+    if let Some(buffer) = TEST_AUDIO.get() {
+        buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(packet);
+    }
+}
+
 fn self_test(path: &Path) -> Result<(), String> {
     TEST_BUFFER
         .set(Mutex::new(ReplayBuffer::new(1.0, BUFFER_BYTES)))
         .map_err(|_| "Self-test already initialized")?;
+    TEST_AUDIO
+        .set(Mutex::new(AudioBuffer::new(3.0)))
+        .map_err(|_| "Audio self-test already initialized")?;
     native::generate_test_video(1, test_frame)?;
+    native::generate_test_audio(1, test_audio)?;
     let mut buffer = TEST_BUFFER
         .get()
         .ok_or("Self-test buffer was not initialized")?
@@ -379,7 +563,23 @@ fn self_test(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    export(&frames, path)?;
+    let mut audio_buffer = TEST_AUDIO
+        .get()
+        .ok_or("Audio self-test buffer was not initialized")?
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let audio = audio_buffer.snapshot_between(
+        frames[0].pts,
+        frames
+            .last()
+            .map_or(frames[0].pts, |frame| frame.pts + frame.duration),
+    );
+    if audio.is_empty() {
+        return Err("Self-test produced no playback audio".into());
+    }
+    export(&frames, &audio, path)?;
+    audio_buffer.clear();
+    drop(audio_buffer);
     let file_size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if file_size < 1024 {
         return Err("Export produced an unexpectedly small file".into());
@@ -389,7 +589,7 @@ fn self_test(path: &Path) -> Result<(), String> {
         return Err("Buffer did not clear".into());
     }
     drop(buffer);
-    println!("Media self-test passed: {} frames, {duration:.3}s, {bytes} buffered bytes, {file_size} file bytes\n{}", frames.len(), path.display());
+    println!("Media self-test passed: {} video frames, {} audio packets, {duration:.3}s, {bytes} buffered video bytes, {file_size} file bytes\n{}", frames.len(), audio.len(), path.display());
     Ok(())
 }
 
@@ -457,7 +657,7 @@ pub fn run() {
                 "Ctrl+Alt+S",
                 "your Videos folder/Optic",
             );
-            println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video to {folder}\n\n--self-test [path.mp4]  Verify encoding, buffering, and export without capturing your screen");
+            println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video and playback audio to {folder}\n\n--self-test [path.mp4]  Verify synthetic video/audio encoding, buffering, and export without capturing your screen or playback device");
             #[cfg(target_os = "windows")]
             println!("--shutdown [seconds]  Finish any active save and close this session's Optic instance (default 120, maximum 600)");
         }
@@ -538,6 +738,231 @@ mod tests {
         state.generation = generation;
     }
 
+    #[cfg(target_os = "windows")]
+    fn synthetic_frame(generation: u64, pts: i64, keyframe: bool) {
+        frame_received(
+            generation,
+            Sample {
+                format: Arc::new(crate::windows::media::VideoFormat {
+                    width: 2,
+                    height: 2,
+                    sequence_header: Arc::from([]),
+                }),
+                bytes: Arc::from([1]),
+                pts,
+                duration: 166_666,
+                keyframe,
+            },
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn synthetic_audio(generation: u64, pts: i64) {
+        audio_received(
+            generation,
+            AudioSample {
+                bytes: Arc::from([0_u8; 1920]),
+                pts,
+                duration: 100_000,
+            },
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn audio_and_video_snapshots_survive_stop_and_reject_old_generations() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset_recorder(Phase::Buffering, 30);
+        synthetic_frame(30, 0, true);
+        synthetic_audio(30, 0);
+        let (frames, audio) = {
+            let state = recorder();
+            (
+                state.buffer.snapshot(),
+                state.audio.snapshot_between(0.0, 1.0),
+            )
+        };
+        handle_capture_event(30, 2, "");
+        synthetic_audio(30, 100_000);
+        assert!(recorder().audio.snapshot_between(0.0, 1.0).is_empty());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].sample.bytes.len(), 1920);
+        reset_recorder(Phase::Starting, 31);
+        synthetic_audio(30, 0);
+        assert!(recorder().audio.snapshot_between(0.0, 1.0).is_empty());
+        synthetic_audio(31, 0);
+        assert_eq!(recorder().audio.snapshot_between(0.0, 1.0).len(), 1);
+        handle_capture_event(31, 4, "Screen capture interrupted");
+        assert!(recorder().audio.snapshot_between(0.0, 1.0).is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn audio_failure_keeps_capture_history_and_ignores_stale_warnings() -> Result<(), Box<dyn Error>>
+    {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Buffering, 32);
+            synthetic_frame(32, 0, true);
+            synthetic_audio(32, 0);
+            handle_capture_event(31, 9, "Old output device unavailable");
+            handle_capture_event(32, 9, "Audio output unavailable; retrying");
+            let state = recorder();
+            assert_eq!(state.phase, Phase::Buffering);
+            assert_eq!(state.buffer.len(), 1);
+            assert_eq!(state.audio.snapshot_between(0.0, 1.0).len(), 1);
+            drop(state);
+            handle_capture_event(32, 2, "");
+            handle_capture_event(32, 9, "Stopped output device unavailable");
+        });
+        let output = logs.contents()?;
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("audio.capture_failed"));
+        assert!(output.contains("generation=32"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recovery_preserves_history_and_accepts_frames_until_fresh_capture_returns() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Buffering, 20);
+            synthetic_frame(20, 0, true);
+            handle_capture_event(
+                20,
+                6,
+                "Screen capture access was lost (HRESULT 0x887A0026).",
+            );
+            {
+                let state = recorder();
+                assert_eq!(state.phase, Phase::Recovering);
+                assert_eq!(state.generation, 20);
+                assert_eq!(state.buffer.len(), 1);
+            }
+            synthetic_frame(20, 333_333, false);
+            handle_capture_event(20, 8, "The screen is still unavailable; retrying.");
+            {
+                let state = recorder();
+                assert_eq!(state.phase, Phase::Unavailable);
+                assert_eq!(state.generation, 20);
+                assert_eq!(state.buffer.len(), 2);
+            }
+            synthetic_frame(20, 666_666, false);
+            handle_capture_event(20, 7, "");
+            let state = recorder();
+            assert_eq!(state.phase, Phase::Buffering);
+            assert_eq!(state.generation, 20);
+            assert_eq!(state.buffer.len(), 3);
+            assert_eq!(state.buffer.bytes(), 3);
+            let frames = state.buffer.snapshot();
+            drop(state);
+            assert_eq!(frames.first().map(|frame| frame.pts), Some(0.0));
+            assert!(frames.first().is_some_and(|frame| frame.keyframe));
+        });
+    }
+
+    #[test]
+    fn recovery_states_keep_save_and_stop_enabled_and_preserve_status_during_save() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        for phase in [Phase::Recovering, Phase::Unavailable] {
+            reset_recorder(phase, 21);
+            assert_eq!(phase.native_state(), Phase::Buffering.native_state());
+            assert!(phase.can_save());
+            recorder().saving = true;
+            save();
+            assert!(recorder().saving);
+            assert_eq!(recorder().phase, phase);
+            finish_save(Ok(PathBuf::from("recovery-clip.mp4")), 21);
+            let state = recorder();
+            assert!(!state.saving);
+            assert_eq!(state.phase, phase);
+            assert_eq!(state.generation, 21);
+            drop(state);
+            let saving = phase.save_status("Saving 2.0 seconds…");
+            let saved = phase.save_status("Saved recovery-clip.mp4");
+            assert!(saving.contains("capture"));
+            assert!(saved.contains("capture"));
+            if phase == Phase::Unavailable {
+                assert!(saving.contains("retrying"));
+                assert!(saved.contains("retrying"));
+            }
+        }
+        for phase in [Phase::Stopped, Phase::Starting, Phase::Stopping] {
+            assert!(!phase.can_save());
+        }
+    }
+
+    #[test]
+    fn recovery_logs_once_per_episode_and_ignores_canceled_stale_or_duplicate_callbacks(
+    ) -> Result<(), Box<dyn Error>> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        let message = "Reading the screen image failed (HRESULT 0x887A0026).";
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Buffering, 22);
+            handle_capture_event(21, 6, message);
+            handle_capture_event(22, 7, "");
+            handle_capture_event(22, 8, message);
+            assert_eq!(recorder().phase, Phase::Buffering);
+            handle_capture_event(22, 6, message);
+            handle_capture_event(22, 6, message);
+            handle_capture_event(21, 7, "");
+            assert_eq!(recorder().phase, Phase::Recovering);
+            handle_capture_event(22, 8, message);
+            handle_capture_event(22, 8, message);
+            handle_capture_event(22, 6, message);
+            assert_eq!(recorder().phase, Phase::Unavailable);
+            handle_capture_event(22, 7, "");
+            handle_capture_event(22, 7, "");
+            handle_capture_event(22, 6, message);
+            assert_eq!(recorder().phase, Phase::Recovering);
+            for phase in [Phase::Stopping, Phase::Stopped] {
+                reset_recorder(phase, 23);
+                for event in 6..=8 {
+                    handle_capture_event(23, event, message);
+                    assert_eq!(recorder().phase, phase);
+                }
+            }
+            reset_recorder(Phase::Buffering, 24);
+            recorder().shutdown = true;
+            for event in 6..=8 {
+                handle_capture_event(24, event, message);
+                assert_eq!(recorder().phase, Phase::Buffering);
+            }
+        });
+        let output = logs.contents()?;
+        assert_eq!(output.lines().count(), 3);
+        assert_eq!(output.matches("event=\"capture.recovering\"").count(), 2);
+        assert_eq!(output.matches("event=\"capture.unavailable\"").count(), 1);
+        assert!(output.lines().all(|line| line.contains("generation=22")));
+        assert!(output.lines().all(|line| line.contains("0x887A0026")));
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn expected_interruption_during_recovery_still_stops_and_clears_history() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        logging::with_test_logger(logs.0.clone(), || {
+            for phase in [Phase::Recovering, Phase::Unavailable] {
+                reset_recorder(phase, 25);
+                synthetic_frame(25, 0, true);
+                assert_eq!(recorder().buffer.len(), 1);
+                handle_capture_event(25, 4, "Screen capture was interrupted by locking.");
+                let state = recorder();
+                assert_eq!(state.phase, Phase::Stopped);
+                assert_eq!(state.buffer.len(), 0);
+                assert_eq!(state.buffer.bytes(), 0);
+            }
+        });
+        assert!(!logs.0.exists());
+    }
+
     #[test]
     fn capture_errors_log_once_and_ignore_canceled_or_stale_work() -> Result<(), Box<dyn Error>> {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -563,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_statuses_and_interruptions_create_no_logs() {
+    fn normal_statuses_and_expected_interruptions_create_no_logs() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let logs = TestLogs::new();
         let message = "Screen capture was interrupted";
@@ -577,6 +1002,60 @@ mod tests {
             finish_save(Ok(PathBuf::from("successful.mp4")), 9);
         });
         assert!(!logs.0.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unexpected_interruption_clears_history_and_logs_only_the_active_capture(
+    ) -> Result<(), Box<dyn Error>> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let logs = TestLogs::new();
+        let message = "Acquiring a screen frame failed (HRESULT 0x887A0026).";
+        logging::with_test_logger(logs.0.clone(), || {
+            reset_recorder(Phase::Starting, 12);
+            handle_capture_event(11, 5, message);
+            assert_eq!(recorder().phase, Phase::Starting);
+            handle_capture_event(12, 1, "");
+            frame_received(
+                12,
+                Sample {
+                    format: Arc::new(crate::windows::media::VideoFormat {
+                        width: 2,
+                        height: 2,
+                        sequence_header: Arc::from([]),
+                    }),
+                    bytes: Arc::from([1]),
+                    pts: 0,
+                    duration: 333_333,
+                    keyframe: true,
+                },
+            );
+            assert_eq!(recorder().buffer.len(), 1);
+            handle_capture_event(12, 5, message);
+            {
+                let state = recorder();
+                assert_eq!(state.phase, Phase::Stopped);
+                assert_eq!(state.buffer.len(), 0);
+                assert_eq!(state.buffer.bytes(), 0);
+            }
+            handle_capture_event(12, 5, message);
+            reset_recorder(Phase::Stopping, 13);
+            handle_capture_event(13, 5, message);
+            assert_eq!(recorder().phase, Phase::Stopping);
+            reset_recorder(Phase::Stopped, 14);
+            handle_capture_event(14, 5, message);
+            assert_eq!(recorder().phase, Phase::Stopped);
+            reset_recorder(Phase::Buffering, 15);
+            recorder().shutdown = true;
+            handle_capture_event(15, 5, message);
+            assert_eq!(recorder().phase, Phase::Buffering);
+        });
+        let output = logs.contents()?;
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("capture.interrupted"));
+        assert!(output.contains("generation=12"));
+        assert!(output.contains("0x887A0026"));
+        Ok(())
     }
 
     #[test]

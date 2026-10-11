@@ -39,7 +39,10 @@ use windows::{
 use super::FrameSink;
 
 const TICKS_PER_SECOND: i64 = 10_000_000;
-const FRAME_DURATION: i64 = TICKS_PER_SECOND / 30;
+const FRAME_RATE: u32 = 60;
+const FRAME_DURATION: i64 = TICKS_PER_SECOND / 60;
+const AUDIO_SAMPLE_RATE: i64 = 48_000;
+const AUDIO_BLOCK_ALIGNMENT: usize = 4;
 
 trait MediaResult<T> {
     fn operation(self, operation: &str) -> Result<T, String>;
@@ -106,6 +109,14 @@ pub struct EncodedSample {
     pub(crate) keyframe: bool,
 }
 
+/// Stereo 48 kHz signed 16-bit PCM. Timing uses the video stream's 100 ns clock.
+#[derive(Clone, Debug)]
+pub struct AudioSample {
+    pub bytes: Arc<[u8]>,
+    pub pts: i64,
+    pub duration: i64,
+}
+
 fn packed_pair(first: u32, second: u32) -> u64 {
     (u64::from(first) << 32) | u64::from(second)
 }
@@ -138,7 +149,7 @@ fn video_type(width: u32, height: u32, subtype: &GUID) -> Result<IMFMediaType, S
             .SetUINT64(&MF_MT_FRAME_SIZE, packed_pair(width, height))
             .operation("Setting the video size")?;
         media
-            .SetUINT64(&MF_MT_FRAME_RATE, packed_pair(30, 1))
+            .SetUINT64(&MF_MT_FRAME_RATE, packed_pair(FRAME_RATE, 1))
             .operation("Setting the frame rate")?;
         media
             .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_pair(1, 1))
@@ -644,7 +655,7 @@ impl Encoder {
             codec_uint(
                 codec,
                 &CODECAPI_AVEncMPVGOPSize,
-                30,
+                FRAME_RATE,
                 "Setting the keyframe interval",
                 true,
             )?;
@@ -1239,11 +1250,131 @@ fn copy_clip(samples: &[EncodedSample]) -> Result<Vec<EncodedSample>, String> {
     Ok(samples.to_vec())
 }
 
+fn trim_audio(samples: &[AudioSample], start: i64, end: i64) -> Result<Vec<AudioSample>, String> {
+    let mut clipped = Vec::new();
+    let mut previous = -1;
+    for sample in samples {
+        if sample.bytes.is_empty()
+            || !sample.bytes.len().is_multiple_of(AUDIO_BLOCK_ALIGNMENT)
+            || sample.pts < 0
+            || sample.duration <= 0
+            || sample.pts <= previous
+        {
+            return Err("Audio packets have invalid PCM data or out-of-order timestamps.".into());
+        }
+        previous = sample.pts;
+        let frames = sample.bytes.len() / AUDIO_BLOCK_ALIGNMENT;
+        let frame_count = i64::try_from(frames).map_err(|error| error.to_string())?;
+        let duration = frame_count
+            .checked_mul(TICKS_PER_SECOND)
+            .ok_or("An audio packet is too large.")?
+            / AUDIO_SAMPLE_RATE;
+        // Packet duration is determined by its PCM sample count. Permit the
+        // sub-sample rounding of the capture clock, but reject corrupt timing.
+        if sample.duration.abs_diff(duration)
+            > u64::try_from(TICKS_PER_SECOND / AUDIO_SAMPLE_RATE)
+                .map_err(|error| error.to_string())?
+        {
+            return Err("An audio packet's duration does not match its PCM sample count.".into());
+        }
+        let packet_end = sample
+            .pts
+            .checked_add(duration)
+            .ok_or("An audio packet's timestamp is too large.")?;
+        if packet_end <= start || sample.pts >= end {
+            continue;
+        }
+        // Keep only complete PCM frames within the video's retained keyframe
+        // interval. Each boundary differs from the video by at most 1/48000 s.
+        let first = if sample.pts < start {
+            (i128::from(start - sample.pts) * i128::from(AUDIO_SAMPLE_RATE)
+                + i128::from(TICKS_PER_SECOND - 1))
+                / i128::from(TICKS_PER_SECOND)
+        } else {
+            0
+        };
+        let last = (i128::from(end - sample.pts) * i128::from(AUDIO_SAMPLE_RATE)
+            / i128::from(TICKS_PER_SECOND))
+        .min(i128::from(frame_count));
+        let first = usize::try_from(first).map_err(|error| error.to_string())?;
+        let last = usize::try_from(last).map_err(|error| error.to_string())?;
+        if first >= last {
+            continue;
+        }
+        let offset = i64::try_from(first).map_err(|error| error.to_string())? * TICKS_PER_SECOND
+            / AUDIO_SAMPLE_RATE;
+        let kept_frames = i64::try_from(last - first).map_err(|error| error.to_string())?;
+        clipped.push(AudioSample {
+            bytes: if first == 0 && last == frames {
+                Arc::clone(&sample.bytes)
+            } else {
+                sample.bytes[first * AUDIO_BLOCK_ALIGNMENT..last * AUDIO_BLOCK_ALIGNMENT].into()
+            },
+            pts: sample.pts + offset,
+            duration: kept_frames * TICKS_PER_SECOND / AUDIO_SAMPLE_RATE,
+        });
+    }
+    Ok(clipped)
+}
+
+fn audio_type(aac: bool) -> Result<IMFMediaType, String> {
+    // SAFETY: The caller owns an initialized export worker; attribute values
+    // describe fixed stereo PCM input or the MP4-compatible AAC output.
+    unsafe {
+        let media = MFCreateMediaType().operation("Creating the audio format")?;
+        media
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+            .operation("Setting the audio media kind")?;
+        media
+            .SetGUID(
+                &MF_MT_SUBTYPE,
+                if aac {
+                    &MFAudioFormat_AAC
+                } else {
+                    &MFAudioFormat_PCM
+                },
+            )
+            .operation("Setting the audio codec")?;
+        for (key, value) in [
+            (&MF_MT_AUDIO_NUM_CHANNELS, 2),
+            (&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000),
+            (&MF_MT_AUDIO_BITS_PER_SAMPLE, 16),
+            (
+                &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                if aac { 24_000 } else { 192_000 },
+            ),
+            (&MF_MT_AUDIO_BLOCK_ALIGNMENT, if aac { 1 } else { 4 }),
+        ] {
+            media
+                .SetUINT32(key, value)
+                .operation("Setting the audio format")?;
+        }
+        if aac {
+            media
+                .SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)
+                .operation("Selecting raw AAC for MP4")?;
+            media
+                .SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)
+                .operation("Setting the AAC profile")?;
+        } else {
+            media
+                .SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)
+                .operation("Setting independent PCM samples")?;
+        }
+        Ok(media)
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Keeping the remux operation together makes COM and temporary-file drop order explicit"
 )]
-fn write_clip(samples: &[EncodedSample], path: &[u16], job: &ExportJob) -> Result<(), String> {
+fn write_clip(
+    samples: &[EncodedSample],
+    audio: &[AudioSample],
+    path: &[u16],
+    job: &ExportJob,
+) -> Result<(), String> {
     let _com = ComRuntime::new()?;
     let _runtime = MediaRuntime::new()?;
     // SAFETY: All file paths are NUL-terminated and all COM objects are created,
@@ -1309,26 +1440,67 @@ fn write_clip(samples: &[EncodedSample], path: &[u16], job: &ExportJob) -> Resul
         writer
             .SetInputMediaType(index, &media, None)
             .operation("Setting compressed MP4 input")?;
+        let audio_index = if audio.is_empty() {
+            None
+        } else {
+            let index = writer
+                .AddStream(&audio_type(true)?)
+                .operation("Adding the MP4 AAC stream")?;
+            writer
+                .SetInputMediaType(index, &audio_type(false)?, None)
+                .operation("Setting PCM input for AAC encoding")?;
+            Some(index)
+        };
         writer.BeginWriting().operation("Starting MP4 output")?;
         let offset = first.pts;
-        for encoded in samples {
+        let mut video = samples.iter().peekable();
+        let mut sound = audio.iter().peekable();
+        let mut audio_end = None;
+        // Interleave by presentation time so the MP4 writer never has to hold
+        // the entire video while it waits for its corresponding audio input.
+        while video.peek().is_some() || sound.peek().is_some() {
             job.check_cancel()?;
-            let rebased = encoded.pts - offset;
-            let sample = make_sample(&encoded.bytes, rebased, encoded.duration, encoded.keyframe)?;
-            sample
-                .SetUINT64(
-                    &MFSampleExtension_DecodeTimestamp,
-                    u64::try_from(rebased).map_err(|error| error.to_string())?,
-                )
-                .operation("Rebasing the decode timestamp")?;
-            writer
-                .WriteSample(index, &sample)
-                .operation("Appending MP4 video")?;
+            if sound
+                .peek()
+                .is_some_and(|packet| video.peek().is_none_or(|frame| packet.pts <= frame.pts))
+            {
+                let packet = sound.next().ok_or("An audio packet is missing.")?;
+                let sample =
+                    make_sample(&packet.bytes, packet.pts - offset, packet.duration, false)?;
+                if audio_end.is_none_or(|end: i64| packet.pts.abs_diff(end) > 1) {
+                    sample
+                        .SetUINT32(&MFSampleExtension_Discontinuity, 1)
+                        .operation("Marking an audio discontinuity")?;
+                }
+                writer
+                    .WriteSample(audio_index.ok_or("The AAC stream is missing.")?, &sample)
+                    .operation("Encoding and appending MP4 audio")?;
+                audio_end = Some(packet.pts + packet.duration);
+            } else {
+                let encoded = video.next().ok_or("A video frame is missing.")?;
+                let rebased = encoded.pts - offset;
+                let sample =
+                    make_sample(&encoded.bytes, rebased, encoded.duration, encoded.keyframe)?;
+                sample
+                    .SetUINT64(
+                        &MFSampleExtension_DecodeTimestamp,
+                        u64::try_from(rebased).map_err(|error| error.to_string())?,
+                    )
+                    .operation("Rebasing the decode timestamp")?;
+                writer
+                    .WriteSample(index, &sample)
+                    .operation("Appending MP4 video")?;
+            }
         }
         job.check_cancel()?;
         writer
             .NotifyEndOfSegment(index)
             .operation("Ending MP4 video")?;
+        if let Some(index) = audio_index {
+            writer
+                .NotifyEndOfSegment(index)
+                .operation("Ending MP4 audio")?;
+        }
         writer.Finalize().operation("Starting MP4 finalization")?;
         completion.wait(job.deadline)?;
         drop(writer);
@@ -1361,8 +1533,24 @@ fn write_clip(samples: &[EncodedSample], path: &[u16], job: &ExportJob) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 pub fn export_samples(samples: &[EncodedSample], path: &Path) -> Result<(), String> {
+    export_samples_with_audio(samples, &[], path)
+}
+
+pub fn export_samples_with_audio(
+    samples: &[EncodedSample],
+    audio: &[AudioSample],
+    path: &Path,
+) -> Result<(), String> {
     let samples = copy_clip(samples)?;
+    let first = samples.first().ok_or("No video frames supplied.")?;
+    let last = samples.last().ok_or("No video frames supplied.")?;
+    let end = last
+        .pts
+        .checked_add(last.duration)
+        .ok_or("The video timeline is too long.")?;
+    let audio = trim_audio(audio, first.pts, end)?;
     let path = file_path(path)?;
     let job = Arc::new(ExportJob::new(Instant::now() + Duration::from_secs(60)));
     let worker_job = Arc::clone(&job);
@@ -1373,7 +1561,7 @@ pub fn export_samples(samples: &[EncodedSample], path: &Path) -> Result<(), Stri
             .name("optic-export".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    write_clip(&samples, &path, &worker_job)
+                    write_clip(&samples, &audio, &path, &worker_job)
                 }))
                 .unwrap_or_else(|_| Err("The MP4 writer failed unexpectedly.".into()));
                 if let Err(error) = result {
@@ -1417,7 +1605,7 @@ pub fn generate_test_video(generation: u64, sink: FrameSink) -> Result<(), Strin
     let mut encoder = Encoder::new(width, height, generation, sink)?;
     let mut pixels =
         vec![0; usize::try_from(width * height * 4).map_err(|error| error.to_string())?];
-    for frame in 0..90_i64 {
+    for frame in 0..180_i64 {
         let square_x = u32::try_from((frame * 5) % i64::from(width - 80))
             .map_err(|error| error.to_string())?;
         for y in 0..height {
@@ -1442,7 +1630,7 @@ pub fn generate_test_video(generation: u64, sink: FrameSink) -> Result<(), Strin
         encoder.encode(
             &pixels,
             usize::try_from(width * 4).map_err(|error| error.to_string())?,
-            frame * TICKS_PER_SECOND / 30,
+            frame * TICKS_PER_SECOND / i64::from(FRAME_RATE),
         )?;
     }
     encoder.finish()
@@ -1533,17 +1721,19 @@ fn verify_decoding(
             )]
             let captured_rate = samples.len() as f64 * TICKS_PER_SECOND as f64
                 / (last.pts - first.pts + last.duration) as f64;
-            if !(27.0..=33.0).contains(&reported_rate) || !(27.0..=33.0).contains(&captured_rate) {
-                return Err(
-                    "Live capture cadence differs materially from the nominal 30 fps".into(),
-                );
+            if reported_rate <= 0.0
+                || captured_rate <= 0.0
+                || reported_rate > f64::from(FRAME_RATE) + 0.1
+                || captured_rate > f64::from(FRAME_RATE) + 0.1
+            {
+                return Err("Live capture cadence exceeds the nominal 60 fps limit".into());
             }
             if (reported_rate - captured_rate).abs() >= 0.1 {
                 return Err(
                     "Live MP4 frame rate does not reflect the captured elapsed timestamps".into(),
                 );
             }
-        } else if (numerator, denominator) != (30, 1) {
+        } else if (numerator, denominator) != (FRAME_RATE, 1) {
             return Err("Unexpected frame rate".into());
         }
         let decoded = MFCreateMediaType().operation("Creating decoder format")?;
@@ -1666,6 +1856,233 @@ mod tests {
     }
 
     #[test]
+    fn pcm_trim_uses_video_boundaries_and_preserves_gaps() -> Result<(), String> {
+        let packets: Vec<_> = [0, 100_000, 400_000]
+            .into_iter()
+            .map(|pts| AudioSample {
+                bytes: vec![42; 480 * AUDIO_BLOCK_ALIGNMENT].into(),
+                pts,
+                duration: 100_000,
+            })
+            .collect();
+        let clipped = trim_audio(&packets, 150_000, 450_000)?;
+        assert_eq!(clipped.len(), 2);
+        assert_eq!(clipped[0].pts, 150_000);
+        assert_eq!(clipped[0].duration, 50_000);
+        assert_eq!(clipped[0].bytes.len(), 240 * AUDIO_BLOCK_ALIGNMENT);
+        assert_eq!(clipped[1].pts, 400_000);
+        assert_eq!(clipped[1].duration, 50_000);
+        assert_eq!(clipped[1].bytes.len(), 240 * AUDIO_BLOCK_ALIGNMENT);
+        let mut invalid = packets[0].clone();
+        invalid.bytes = vec![0; 3].into();
+        assert!(trim_audio(&[invalid], 0, 500_000).is_err());
+        assert!(trim_audio(&[packets[1].clone(), packets[0].clone()], 0, 500_000).is_err());
+        assert!(trim_audio(&packets, 500_000, 600_000)?.is_empty());
+        Ok(())
+    }
+
+    fn tone_packets() -> Vec<AudioSample> {
+        (0..400)
+            .map(|packet| {
+                let mut bytes = Vec::with_capacity(480 * AUDIO_BLOCK_ALIGNMENT);
+                for frame in 0..480 {
+                    let phase =
+                        f64::from(packet * 480 + frame) * 440.0 * std::f64::consts::TAU / 48_000.0;
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::as_conversions,
+                        reason = "The bounded synthetic sine wave fits in signed 16-bit PCM"
+                    )]
+                    let value = (phase.sin() * 10_000.0) as i16;
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                AudioSample {
+                    bytes: bytes.into(),
+                    pts: i64::from(packet) * 100_000,
+                    duration: 100_000,
+                }
+            })
+            .collect()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The bounded integration verifier checks codec, decoded PCM, tone and clip timing together"
+    )]
+    fn verify_audio_tone(path: &Path, expected_duration: i64) -> Result<(), String> {
+        let _com = ComRuntime::new()?;
+        let _runtime = MediaRuntime::new()?;
+        let path = file_path(path)?;
+        let audio = sdk_uint(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0);
+        // SAFETY: The source reader and sample buffers belong to this initialized
+        // MTA test thread. All output pointers and the path remain live for calls.
+        unsafe {
+            let stream = MFCreateFile(
+                MF_ACCESSMODE_READ,
+                MF_OPENMODE_FAIL_IF_NOT_EXIST,
+                MF_FILEFLAGS_NONE,
+                PCWSTR(path.as_ptr()),
+            )
+            .operation("Opening the audio test clip")?;
+            let reader = MFCreateSourceReaderFromByteStream(&stream, None)
+                .operation("Opening the audio test decoder")?;
+            reader
+                .SetStreamSelection(sdk_uint(MF_SOURCE_READER_ALL_STREAMS.0), false)
+                .operation("Deselecting the audio test streams")?;
+            reader
+                .SetStreamSelection(audio, true)
+                .operation("Selecting the audio test stream")?;
+            let native = reader
+                .GetNativeMediaType(audio, 0)
+                .operation("Reading the exported AAC format")?;
+            assert_eq!(
+                native
+                    .GetGUID(&MF_MT_SUBTYPE)
+                    .operation("Reading the audio codec")?,
+                MFAudioFormat_AAC
+            );
+            assert_eq!(
+                native
+                    .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+                    .operation("Reading the audio sample rate")?,
+                48_000
+            );
+            assert_eq!(
+                native
+                    .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
+                    .operation("Reading audio channels")?,
+                2
+            );
+            reader
+                .SetCurrentMediaType(audio, None, &audio_type(false)?)
+                .operation("Selecting decoded 16-bit PCM")?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut decoded = Vec::new();
+            let mut previous = -1;
+            let mut last_end = 0;
+            let mut ended = false;
+            for _ in 0..1000 {
+                if Instant::now() >= deadline {
+                    return Err("Decoding the audio test clip timed out.".into());
+                }
+                let (mut flags, mut pts, mut sample) = (0, 0, None);
+                reader
+                    .ReadSample(
+                        audio,
+                        0,
+                        None,
+                        Some(&raw mut flags),
+                        Some(&raw mut pts),
+                        Some(&raw mut sample),
+                    )
+                    .operation("Decoding AAC into PCM")?;
+                if flags & sdk_uint(MF_SOURCE_READERF_ERROR.0) != 0 {
+                    return Err("The AAC decoder reported an error.".into());
+                }
+                if let Some(sample) = sample {
+                    assert!(pts > previous, "Decoded audio timestamps must increase");
+                    if previous < 0 {
+                        assert!(pts.abs() <= 1, "Audio must share the rebased video origin");
+                    }
+                    previous = pts;
+                    last_end = pts
+                        + sample
+                            .GetSampleDuration()
+                            .operation("Reading decoded audio duration")?;
+                    let buffer = sample
+                        .ConvertToContiguousBuffer()
+                        .operation("Reading decoded PCM")?;
+                    let locked = LockedBuffer::new(&buffer, "Locking decoded PCM")?;
+                    if locked.data.is_null() || !locked.length.is_multiple_of(AUDIO_BLOCK_ALIGNMENT)
+                    {
+                        return Err("The AAC decoder returned invalid stereo PCM.".into());
+                    }
+                    // SAFETY: The buffer lock owns length readable bytes until
+                    // finish; only copied i16 values escape this borrowed slice.
+                    let bytes = std::slice::from_raw_parts(locked.data, locked.length);
+                    for frame in bytes.as_chunks::<AUDIO_BLOCK_ALIGNMENT>().0 {
+                        decoded.push(i16::from_le_bytes([frame[0], frame[1]]));
+                    }
+                    locked.finish("Unlocking decoded PCM")?;
+                }
+                if flags & sdk_uint(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
+                    ended = true;
+                    break;
+                }
+            }
+            assert!(ended, "The AAC decoder must reach the stream end");
+            // AAC uses 1024-frame blocks and can expose encoder priming/padding.
+            assert!(
+                last_end.abs_diff(expected_duration) < 450_000,
+                "AAC timing must stay within two codec blocks of video"
+            );
+            assert!(
+                decoded.len() > 48_000,
+                "AAC must fully decode the retained tone"
+            );
+            let mean_amplitude = decoded
+                .iter()
+                .map(|value| i64::from(*value).abs())
+                .sum::<i64>()
+                / i64::try_from(decoded.len()).map_err(|error| error.to_string())?;
+            assert!(
+                mean_amplitude > 1000,
+                "The AAC track must contain the captured tone"
+            );
+            let tone = decoded
+                .get(2048..12_048)
+                .ok_or("The decoded tone is too short.")?;
+            let crossings = tone
+                .windows(2)
+                .filter(|pair| pair[0] <= 0 && pair[1] > 0)
+                .count();
+            let frequency = u64::try_from(crossings).map_err(|error| error.to_string())? * 48_000
+                / u64::try_from(tone.len()).map_err(|error| error.to_string())?;
+            assert!(
+                (425..=450).contains(&frequency),
+                "The decoded tone must preserve its 440 Hz frequency"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sixty_fps_video_and_trimmed_aac_tone_fully_decode() -> Result<(), String> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let directory = TestDirectory::new()?;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&received);
+        generate_test_video(
+            8,
+            Arc::new(move |_, sample| {
+                output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(sample);
+            }),
+        )?;
+        let samples = received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(samples.len(), 180);
+        assert!(samples[60].keyframe);
+        let video = &samples[60..];
+        let clip = directory.0.join("sixty-fps-with-audio.mp4");
+        export_samples_with_audio(video, &tone_packets(), &clip)?;
+        verify_clip(&clip, 120)?;
+        verify_audio_tone(&clip, 2 * TICKS_PER_SECOND)?;
+        let mut audio = tone_packets();
+        audio.retain(|packet| !(15_000_000..17_000_000).contains(&packet.pts));
+        let gap_clip = directory.0.join("sixty-fps-with-audio-gap.mp4");
+        export_samples_with_audio(video, &audio, &gap_clip)?;
+        verify_clip(&gap_clip, 120)?;
+        verify_audio_tone(&gap_clip, 2 * TICKS_PER_SECOND)?;
+        Ok(())
+    }
+
+    #[test]
     fn encoder_snapshots_fully_decode_and_export_failures_leave_no_files() -> Result<(), String> {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let directory = TestDirectory::new()?;
@@ -1683,8 +2100,8 @@ mod tests {
         let frames = received.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
             frames.len(),
-            90,
-            "Synthetic encoder must deliver ninety frames"
+            180,
+            "Synthetic encoder must deliver three seconds at sixty frames per second"
         );
         assert!(frames[0].1.keyframe);
         assert_eq!(frames[0].1.pts, 0);
@@ -1709,7 +2126,7 @@ mod tests {
         drop(frames);
         let full = directory.0.join("full.mp4");
         export_samples(&samples, &full)?;
-        verify_clip(&full, 90)?;
+        verify_clip(&full, 180)?;
         let original_size = std::fs::metadata(&full)
             .map_err(|error| error.to_string())?
             .len();
@@ -1724,12 +2141,12 @@ mod tests {
             original_size
         );
         assert!(
-            samples[30].keyframe,
+            samples[60].keyframe,
             "One-second boundary must be a keyframe"
         );
         let clip = directory.0.join("Replay-视频-é.mp4");
-        export_samples(&samples[30..], &clip)?;
-        verify_clip(&clip, 60)?;
+        export_samples(&samples[60..], &clip)?;
+        verify_clip(&clip, 120)?;
         let mut deep_directory = directory.0.clone();
         for _ in 0..4 {
             deep_directory.push("x".repeat(70));
@@ -1737,8 +2154,8 @@ mod tests {
         std::fs::create_dir_all(&deep_directory).map_err(|error| error.to_string())?;
         let deep_clip = deep_directory.join("deep.mp4");
         assert!(deep_clip.as_os_str().encode_wide().count() > 260);
-        export_samples(&samples[30..], &deep_clip)?;
-        verify_clip(&deep_clip, 60)?;
+        export_samples(&samples[60..], &deep_clip)?;
+        verify_clip(&deep_clip, 120)?;
         let invalid = directory.0.join("invalid.mp4");
         assert!(
             export_samples(&samples[1..], &invalid).is_err(),
@@ -1771,6 +2188,6 @@ mod tests {
     fn verify_external_clip() -> Result<(), String> {
         let path =
             std::env::var_os("OPTIC_VERIFY_CLIP").ok_or("OPTIC_VERIFY_CLIP was not supplied")?;
-        verify_clip(Path::new(&path), 60)
+        verify_clip(Path::new(&path), 120)
     }
 }

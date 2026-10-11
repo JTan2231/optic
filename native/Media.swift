@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -9,9 +10,16 @@ import VideoToolbox
 public typealias FrameCallback = @convention(c) (
     UInt64, UnsafeMutableRawPointer?, Double, Double, Int, Bool
 ) -> Void
-// Event kinds: 1 = started, 2 = stopped, 3 = error, 4 = expected interruption.
+public typealias AudioCallback = @convention(c) (
+    UInt64, UnsafeMutableRawPointer?, Double, Double, Int
+) -> Void
+// Event kinds: 1 = started, 2 = stopped, 3 = error, 4 = expected interruption,
+// 9 = system audio unavailable (video continues).
 // The message is borrowed UTF-8 and is valid only for the callback invocation.
 public typealias EventCallback = @convention(c) (UInt64, Int32, UnsafePointer<CChar>?) -> Void
+
+private let captureFrameRate: Int32 = 60
+private let audioSampleRate = 48_000
 
 private struct MediaFailure: Error, CustomStringConvertible {
     let description: String
@@ -72,8 +80,41 @@ private final class FrameGate {
         // Exactly one retain is transferred. Rust eventually calls optic_sample_release.
         let pointer = Unmanaged.passRetained(sample).toOpaque()
         callback(generation, pointer, pts,
-                 duration.isFinite && duration > 0 ? duration : 1.0 / 30.0,
+                 duration.isFinite && duration > 0 ? duration : 1.0 / Double(captureFrameRate),
                  CMSampleBufferGetTotalSampleSize(sample), isKeyframe(sample))
+    }
+}
+
+// Raw PCM is retained with its CoreMedia storage. AAC encoding happens only
+// when a save snapshot is exported, so live capture has no audio encoder queue.
+private final class AudioGate {
+    private let lock = NSLock()
+    private var active = true
+    private let generation: UInt64
+    private let callback: AudioCallback
+
+    init(generation: UInt64, callback: @escaping AudioCallback) {
+        self.generation = generation
+        self.callback = callback
+    }
+
+    func disable() {
+        lock.lock()
+        active = false
+        lock.unlock()
+    }
+
+    func deliver(_ sample: CMSampleBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active else { return }
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let duration = CMTimeGetSeconds(CMSampleBufferGetDuration(sample))
+        let size = max(CMSampleBufferGetTotalSampleSize(sample),
+                       CMSampleBufferGetDataBuffer(sample).map { CMBlockBufferGetDataLength($0) } ?? 0)
+        guard pts.isFinite, duration.isFinite, duration > 0, size > 0 else { return }
+        let pointer = Unmanaged.passRetained(sample).toOpaque()
+        callback(generation, pointer, pts, duration, size)
     }
 }
 
@@ -133,8 +174,8 @@ private final class H264Encoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: 8_000_000,
-            kVTCompressionPropertyKey_ExpectedFrameRate: 30,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: 30,
+            kVTCompressionPropertyKey_ExpectedFrameRate: captureFrameRate,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: captureFrameRate,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 1.0,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
             kVTCompressionPropertyKey_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
@@ -167,7 +208,7 @@ private final class H264Encoder {
         if forceKeyframe { lastForcedKeyframe = pts }
         try check(VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
-            duration: CMTime(value: 1, timescale: 30),
+            duration: CMTime(value: 1, timescale: captureFrameRate),
             frameProperties: forceKeyframe
                 ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil,
             sourceFrameRefcon: nil, infoFlagsOut: nil), "Submitting a video frame")
@@ -196,10 +237,17 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private let queue: DispatchQueue
     private let eventCallback: EventCallback
     private let gate: FrameGate
+    private let audioGate: AudioGate
     private var stream: SCStream?
+    private var streamFilter: SCContentFilter?
+    private var streamConfiguration: SCStreamConfiguration?
+    private var audioEnabled = true
+    private var audioWarningReported = false
+    private var previousAudioPTS: CMTime?
     private var encoder: H264Encoder?
     private var timer: DispatchSourceTimer?
     private var latestPixelBuffer: CVPixelBuffer?
+    private var lastEncodedPTS: CMTime?
     private var width = 0
     private var height = 0
     private var starting = false
@@ -210,15 +258,23 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var completions: [() -> Void] = []
 
     init(generation: UInt64, queue: DispatchQueue,
-         frameCallback: @escaping FrameCallback, eventCallback: @escaping EventCallback) {
+         frameCallback: @escaping FrameCallback, audioCallback: @escaping AudioCallback,
+         eventCallback: @escaping EventCallback) {
         self.generation = generation
         self.queue = queue
         self.eventCallback = eventCallback
         gate = FrameGate(generation: generation, callback: frameCallback)
+        audioGate = AudioGate(generation: generation, callback: audioCallback)
     }
 
     private func event(_ kind: Int32, _ message: String) {
         message.withCString { eventCallback(generation, kind, $0) }
+    }
+
+    private func audioWarning(_ message: String) {
+        guard !audioWarningReported else { return }
+        audioWarningReported = true
+        event(9, message)
     }
 
     func start() {
@@ -241,29 +297,53 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 let configuration = SCStreamConfiguration()
                 configuration.width = self.width
                 configuration.height = self.height
-                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: captureFrameRate)
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
                 configuration.colorSpaceName = CGColorSpace.sRGB
                 configuration.showsCursor = true
-                configuration.capturesAudio = false
+                configuration.capturesAudio = true
+                configuration.sampleRate = audioSampleRate
+                configuration.channelCount = 2
+                configuration.excludesCurrentProcessAudio = false
                 configuration.queueDepth = 3
                 let filter = SCContentFilter(display: display, excludingWindows: [])
-                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+                self.streamFilter = filter
+                self.streamConfiguration = configuration
                 do {
                     self.encoder = try H264Encoder(width: self.width, height: self.height, gate: self.gate) { [weak self] error in
                         guard let self else { return }
                         self.queue.async { self.fail(error.description) }
                     }
-                    try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
-                    self.stream = stream
-                    self.starting = true
-                    stream.startCapture { error in
-                        self.queue.async { self.didStart(error) }
-                    }
+                    try self.startStream()
                 } catch {
                     self.fail(mediaErrorDescription(error, operation: "Unable to configure screen capture"))
                 }
             }
+        }
+    }
+
+    private func startStream() throws {
+        guard let filter = streamFilter, let configuration = streamConfiguration else {
+            throw MediaFailure("The screen capture configuration is missing.")
+        }
+        configuration.capturesAudio = audioEnabled
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if audioEnabled {
+            do {
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+            } catch {
+                try? stream.removeStreamOutput(self, type: .screen)
+                audioEnabled = false
+                audioWarning(mediaErrorDescription(error, operation: "System audio unavailable; recording video only"))
+                try startStream()
+                return
+            }
+        }
+        self.stream = stream
+        starting = true
+        stream.startCapture { error in
+            self.queue.async { self.didStart(error) }
         }
     }
 
@@ -274,11 +354,23 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         if let error {
+            if audioEnabled {
+                audioEnabled = false
+                audioWarning(mediaErrorDescription(error, operation: "System audio capture could not start; retrying video only"))
+                if let stream {
+                    try? stream.removeStreamOutput(self, type: .audio)
+                    try? stream.removeStreamOutput(self, type: .screen)
+                }
+                stream = nil
+                do { try startStream() }
+                catch { fail(mediaErrorDescription(error, operation: "Unable to start screen capture")) }
+                return
+            }
             fail(mediaErrorDescription(error, operation: "Unable to start screen capture"))
             return
         }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .nanoseconds(33_333_333), leeway: .milliseconds(2))
+        timer.schedule(deadline: .now(), leeway: .milliseconds(2))
         timer.setEventHandler { [weak self] in self?.encodeLatestFrame() }
         self.timer = timer
         timer.resume()
@@ -286,14 +378,51 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func encodeLatestFrame() {
+        let tickStart = DispatchTime.now()
+        defer {
+            if !stopping, let timer {
+                let nextTick = tickStart + .nanoseconds(16_666_667)
+                let now = DispatchTime.now()
+                // Schedule from the actual tick start. A slow capture proceeds
+                // immediately, while a fast one waits out the remaining interval.
+                timer.schedule(deadline: now.uptimeNanoseconds >= nextTick.uptimeNanoseconds ? now : nextTick,
+                               leeway: .milliseconds(2))
+            }
+        }
         guard !stopping, let latestPixelBuffer, let encoder else { return }
+        let pts = CMClockGetTime(CMClockGetHostTimeClock())
+        // Delayed dispatch handlers can run close together. Skip such ticks
+        // rather than encoding a burst above the selected capture frame rate.
+        guard lastEncodedPTS == nil
+            || CMTimeCompare(CMTimeSubtract(pts, lastEncodedPTS!),
+                             CMTime(value: 1, timescale: captureFrameRate)) >= 0 else { return }
         do {
-            try encoder.encode(latestPixelBuffer, at: CMClockGetTime(CMClockGetHostTimeClock()))
+            try encoder.encode(latestPixelBuffer, at: pts)
+            lastEncodedPTS = pts
         } catch { fail(mediaErrorDescription(error, operation: "Unable to encode the screen capture")) }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard !stopping, outputType == .screen, CMSampleBufferIsValid(sample) else { return }
+        guard !stopping, self.stream === stream, CMSampleBufferIsValid(sample) else { return }
+        if outputType == .audio {
+            guard audioEnabled, CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) > 0 else { return }
+            do {
+                let copy = try hostTimedAudioSample(sample, clock: stream.synchronizationClock)
+                let pts = CMSampleBufferGetPresentationTimeStamp(copy)
+                let duration = CMSampleBufferGetDuration(copy)
+                guard pts.isNumeric, duration.isNumeric, CMTimeCompare(duration, .zero) > 0,
+                      previousAudioPTS == nil || CMTimeCompare(pts, previousAudioPTS!) > 0 else {
+                    audioWarning("System audio supplied invalid or out-of-order timing; affected audio packets were omitted.")
+                    return
+                }
+                previousAudioPTS = pts
+                audioGate.deliver(copy)
+            } catch {
+                audioWarning(mediaErrorDescription(error, operation: "System audio packet was omitted"))
+            }
+            return
+        }
+        guard outputType == .screen else { return }
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
             as? [[SCStreamFrameInfo: Any]]
         guard let rawStatus = attachments?.first?[.status] as? NSNumber,
@@ -317,7 +446,10 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        queue.async { self.fail(mediaErrorDescription(error, operation: "Screen capture stopped unexpectedly")) }
+        queue.async {
+            guard self.stream === stream else { return }
+            self.fail(mediaErrorDescription(error, operation: "Screen capture stopped unexpectedly"))
+        }
     }
 
     private func fail(_ message: String) {
@@ -339,6 +471,7 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         if stopping { return }
         stopping = true
         gate.disable()
+        audioGate.disable()
         timer?.cancel()
         timer = nil
         latestPixelBuffer = nil
@@ -359,8 +492,13 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         finished = true
         try? encoder?.finish()
         encoder = nil
-        if let stream { try? stream.removeStreamOutput(self, type: .screen) }
+        if let stream {
+            try? stream.removeStreamOutput(self, type: .screen)
+            if audioEnabled { try? stream.removeStreamOutput(self, type: .audio) }
+        }
         stream = nil
+        streamFilter = nil
+        streamConfiguration = nil
         if sendStopped { event(2, "Screen capture stopped.") }
         let callbacks = completions
         completions.removeAll()
@@ -373,11 +511,12 @@ private final class CaptureManager {
     private let queue = DispatchQueue(label: "optic.capture")
     private var current: CaptureSession?
 
-    func start(generation: UInt64, frames: @escaping FrameCallback, events: @escaping EventCallback) {
+    func start(generation: UInt64, frames: @escaping FrameCallback, audio: @escaping AudioCallback,
+               events: @escaping EventCallback) {
         queue.async {
             if self.current?.generation == generation { return }
             let session = CaptureSession(generation: generation, queue: self.queue,
-                                         frameCallback: frames, eventCallback: events)
+                                         frameCallback: frames, audioCallback: audio, eventCallback: events)
             let previous = self.current
             self.current = session
             if let previous {
@@ -401,8 +540,8 @@ private final class CaptureManager {
 
 @_cdecl("optic_capture_start")
 public func optic_capture_start(_ generation: UInt64, _ frames: @escaping FrameCallback,
-                                _ events: @escaping EventCallback) {
-    CaptureManager.shared.start(generation: generation, frames: frames, events: events)
+                                _ audio: @escaping AudioCallback, _ events: @escaping EventCallback) {
+    CaptureManager.shared.start(generation: generation, frames: frames, audio: audio, events: events)
 }
 
 @_cdecl("optic_capture_stop")
@@ -415,32 +554,116 @@ public func optic_sample_release(_ sample: UnsafeMutableRawPointer?) {
     if let sample { Unmanaged<CMSampleBuffer>.fromOpaque(sample).release() }
 }
 
-private func rebasedSample(_ sample: CMSampleBuffer, offset: CMTime) throws -> CMSampleBuffer {
+private func retimedSample(_ sample: CMSampleBuffer, transform: (CMTime) -> CMTime,
+                          durationTransform: ((CMTime, CMTime) -> CMTime)? = nil) throws -> CMSampleBuffer {
     var count = 0
     try check(CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0,
-        arrayToFill: nil, entriesNeededOut: &count), "Reading video timing")
-    guard count > 0 else { throw MediaFailure("The video frame has no timing information.") }
+        arrayToFill: nil, entriesNeededOut: &count), "Reading sample timing")
+    guard count > 0 else { throw MediaFailure("The media sample has no timing information.") }
     var timings = Array(repeating: CMSampleTimingInfo(duration: .invalid,
         presentationTimeStamp: .invalid, decodeTimeStamp: .invalid), count: count)
     try check(CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count,
-        arrayToFill: &timings, entriesNeededOut: &count), "Reading video timing")
+        arrayToFill: &timings, entriesNeededOut: &count), "Reading sample timing")
     for index in timings.indices {
-        timings[index].presentationTimeStamp = CMTimeSubtract(timings[index].presentationTimeStamp, offset)
+        let originalPTS = timings[index].presentationTimeStamp
+        if let durationTransform, timings[index].duration.isNumeric {
+            timings[index].duration = durationTransform(originalPTS, timings[index].duration)
+        }
+        timings[index].presentationTimeStamp = transform(originalPTS)
         if timings[index].decodeTimeStamp.isNumeric {
-            timings[index].decodeTimeStamp = CMTimeSubtract(timings[index].decodeTimeStamp, offset)
+            timings[index].decodeTimeStamp = transform(timings[index].decodeTimeStamp)
         }
     }
     var copy: CMSampleBuffer?
     try check(CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
         sampleBuffer: sample, sampleTimingEntryCount: timings.count, sampleTimingArray: &timings,
-        sampleBufferOut: &copy), "Rebasing video timing")
-    guard let copy else { throw MediaFailure("Unable to copy the video sample.") }
+        sampleBufferOut: &copy), "Adjusting sample timing")
+    guard let copy else { throw MediaFailure("Unable to copy the media sample.") }
+    return copy
+}
+
+private func rebasedSample(_ sample: CMSampleBuffer, offset: CMTime) throws -> CMSampleBuffer {
+    try retimedSample(sample, transform: { CMTimeSubtract($0, offset) })
+}
+
+private func hostTimedAudioSample(_ sample: CMSampleBuffer, clock: CMClock?) throws -> CMSampleBuffer {
+    guard let format = CMSampleBufferGetFormatDescription(sample),
+          CMFormatDescriptionGetMediaType(format) == kCMMediaType_Audio,
+          CMFormatDescriptionGetMediaSubType(format) == kAudioFormatLinearPCM,
+          let description = CMAudioFormatDescriptionGetStreamBasicDescription(format),
+          description.pointee.mSampleRate == Double(audioSampleRate),
+          description.pointee.mChannelsPerFrame == 2 else {
+        throw MediaFailure("System audio did not provide 48 kHz stereo PCM.")
+    }
+    guard let clock else { throw MediaFailure("The system audio synchronization clock is unavailable.") }
+    let hostClock = CMClockGetHostTimeClock()
+    // ScreenCaptureKit's synchronization clock timestamps its PCM packets.
+    // Convert to the host clock used by the video timer before transferring them.
+    return try retimedSample(sample, transform: {
+        CMSyncConvertTime($0, from: clock, to: hostClock)
+    }, durationTransform: { pts, duration in
+        CMTimeSubtract(CMSyncConvertTime(CMTimeAdd(pts, duration), from: clock, to: hostClock),
+                       CMSyncConvertTime(pts, from: clock, to: hostClock))
+    })
+}
+
+private func trimmedAudioSample(_ sample: CMSampleBuffer, start: CMTime,
+                                end: CMTime) throws -> CMSampleBuffer? {
+    guard CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+          let format = CMSampleBufferGetFormatDescription(sample),
+          CMFormatDescriptionGetMediaSubType(format) == kAudioFormatLinearPCM,
+          let description = CMAudioFormatDescriptionGetStreamBasicDescription(format) else {
+        throw MediaFailure("The audio snapshot contains an invalid PCM sample.")
+    }
+    let rate = description.pointee.mSampleRate
+    let count = CMSampleBufferGetNumSamples(sample)
+    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+    guard rate.isFinite, rate > 0, rate <= 192_000, count > 0,
+          count <= 1_920_000, pts.isNumeric else {
+        throw MediaFailure("The audio snapshot contains invalid timing or sample counts.")
+    }
+    // Keep whole PCM frames inside the selected video interval. The rounding
+    // loses at most one audio frame at either edge, without AAC packet edits.
+    let firstFrame = ceil(CMTimeGetSeconds(CMTimeSubtract(start, pts)) * rate)
+    let finalFrame = floor(CMTimeGetSeconds(CMTimeSubtract(end, pts)) * rate)
+    guard firstFrame.isFinite, finalFrame.isFinite else {
+        throw MediaFailure("The audio snapshot has invalid clip boundaries.")
+    }
+    let first = Int(min(Double(count), max(0, firstFrame)))
+    let last = Int(min(Double(count), max(0, finalFrame)))
+    guard last > first else { return nil }
+    if first == 0, last == count { return sample }
+    let frames = last - first
+    guard let pcmFormat = AVAudioFormat(streamDescription: description),
+          let pcm = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(frames)) else {
+        throw MediaFailure("Unable to allocate trimmed PCM audio.")
+    }
+    pcm.frameLength = AVAudioFrameCount(frames)
+    try check(CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: Int32(first),
+        frameCount: Int32(frames), into: pcm.mutableAudioBufferList), "Copying trimmed PCM audio")
+    var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
+    try check(CMSampleBufferGetSampleTimingInfo(sample, at: first, timingInfoOut: &timing),
+              "Reading trimmed PCM timing")
+    var copy: CMSampleBuffer?
+    // CopySampleBufferForRange does not support non-interleaved audio. Building
+    // from a matching AudioBufferList preserves either ScreenCaptureKit layout.
+    try check(CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: nil, dataReady: false,
+        makeDataReadyCallback: nil, refcon: nil, formatDescription: format, sampleCount: frames,
+        sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 0,
+        sampleSizeArray: nil, sampleBufferOut: &copy), "Creating trimmed PCM audio")
+    guard let copy else { throw MediaFailure("Unable to trim the audio sample.") }
+    try check(CMSampleBufferSetDataBufferFromAudioBufferList(copy, blockBufferAllocator: kCFAllocatorDefault,
+        blockBufferMemoryAllocator: kCFAllocatorDefault,
+        flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, bufferList: pcm.audioBufferList),
+        "Retaining trimmed PCM storage")
+    try check(CMSampleBufferSetDataReady(copy), "Making trimmed PCM audio ready")
     return copy
 }
 
 // Synchronous worker API. The caller keeps every sample alive until this function returns.
 @_cdecl("optic_export")
 public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _ count: Int,
+                         _ audioPointers: UnsafePointer<UnsafeMutableRawPointer?>?, _ audioCount: Int,
                          _ path: UnsafePointer<CChar>?, _ errorBuffer: UnsafeMutablePointer<CChar>?,
                          _ errorCapacity: Int) -> Bool {
     if let errorBuffer, errorCapacity > 0 { errorBuffer[0] = 0 }
@@ -464,6 +687,31 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
         }
         let offset = CMSampleBufferGetPresentationTimeStamp(first)
         guard offset.isNumeric else { throw MediaFailure("The clip has an invalid start time.") }
+        guard let finalVideo = samples.last else { throw MediaFailure("The clip has no final video frame.") }
+        let finalDuration = CMSampleBufferGetDuration(finalVideo)
+        guard finalDuration.isNumeric, CMTimeCompare(finalDuration, .zero) > 0 else {
+            throw MediaFailure("The clip has an invalid video duration.")
+        }
+        let end = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(finalVideo), finalDuration)
+        guard end.isNumeric, CMTimeCompare(end, offset) > 0 else {
+            throw MediaFailure("The clip has an invalid end time.")
+        }
+        var audioSamples: [CMSampleBuffer] = []
+        guard audioCount >= 0, audioCount == 0 || audioPointers != nil else {
+            throw MediaFailure("The audio snapshot is missing.")
+        }
+        if let audioPointers {
+            var audioCursor = offset
+            for index in 0..<audioCount {
+                guard let pointer = audioPointers[index] else { throw MediaFailure("An audio sample is missing.") }
+                let sample = Unmanaged<CMSampleBuffer>.fromOpaque(pointer).takeUnretainedValue()
+                if let trimmed = try trimmedAudioSample(sample, start: audioCursor, end: end) {
+                    audioSamples.append(try rebasedSample(trimmed, offset: offset))
+                    audioCursor = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(trimmed),
+                                            CMSampleBufferGetDuration(trimmed))
+                }
+            }
+        }
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         var succeeded = false
         defer {
@@ -476,9 +724,23 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
         input.expectsMediaDataInRealTime = false
         guard writer.canAdd(input) else { throw MediaFailure("Unable to write this H.264 format to MP4.") }
         writer.add(input)
-        guard writer.startWriting() else { throw writer.error ?? MediaFailure("Unable to start writing the MP4 file.") }
-        writer.startSession(atSourceTime: .zero)
-        let deadline = ProcessInfo.processInfo.systemUptime + 60.0
+        var audioInput: AVAssetWriterInput?
+        if let firstAudio = audioSamples.first {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRate,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192_000
+            ]
+            let candidate = AVAssetWriterInput(mediaType: .audio, outputSettings: settings,
+                                               sourceFormatHint: CMSampleBufferGetFormatDescription(firstAudio))
+            candidate.expectsMediaDataInRealTime = false
+            guard writer.canAdd(candidate) else { throw MediaFailure("Unable to add AAC audio to MP4.") }
+            writer.add(candidate)
+            audioInput = candidate
+        }
+        var videoSamples: [CMSampleBuffer] = []
+        videoSamples.reserveCapacity(samples.count)
         var previousPTS: CMTime?
         for sample in samples {
             guard let sampleFormat = CMSampleBufferGetFormatDescription(sample),
@@ -490,15 +752,53 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
                 throw MediaFailure("Video frames have invalid or out-of-order timestamps.")
             }
             previousPTS = pts
-            while !input.isReadyForMoreMediaData {
-                guard writer.status == .writing else { throw writer.error ?? MediaFailure("The MP4 writer stopped unexpectedly.") }
-                guard ProcessInfo.processInfo.systemUptime < deadline else { throw MediaFailure("Writing the MP4 timed out.") }
+            videoSamples.append(try rebasedSample(sample, offset: offset))
+        }
+        guard writer.startWriting() else { throw writer.error ?? MediaFailure("Unable to start writing the MP4 file.") }
+        writer.startSession(atSourceTime: .zero)
+        let deadline = ProcessInfo.processInfo.systemUptime + 60.0
+        var videoIndex = 0, audioIndex = 0
+        var videoFinished = false, audioFinished = audioInput == nil
+        // Prefer chronological writes, but feed the other ready input when
+        // one is backpressured. This also handles audio that starts late or ends
+        // early without making the writer wait indefinitely for the other track.
+        while videoIndex < videoSamples.count || audioIndex < audioSamples.count {
+            if videoIndex == videoSamples.count, !videoFinished {
+                input.markAsFinished()
+                videoFinished = true
+            }
+            if audioIndex == audioSamples.count, !audioFinished {
+                audioInput?.markAsFinished()
+                audioFinished = true
+            }
+            guard writer.status == .writing else {
+                throw writer.error ?? MediaFailure("The MP4 writer stopped unexpectedly.")
+            }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw MediaFailure("Writing the MP4 timed out.")
+            }
+            let videoReady = videoIndex < videoSamples.count && input.isReadyForMoreMediaData
+            let audioReady = audioIndex < audioSamples.count && (audioInput?.isReadyForMoreMediaData ?? false)
+            let preferAudio = audioIndex < audioSamples.count && (videoIndex == videoSamples.count
+                || CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(audioSamples[audioIndex]),
+                                 CMSampleBufferGetPresentationTimeStamp(videoSamples[videoIndex])) <= 0)
+            if audioReady && (preferAudio || !videoReady), let audioInput {
+                guard audioInput.append(audioSamples[audioIndex]) else {
+                    throw writer.error ?? MediaFailure("Unable to append PCM audio to MP4.")
+                }
+                audioIndex += 1
+            } else if videoReady {
+                guard input.append(videoSamples[videoIndex]) else {
+                    throw writer.error ?? MediaFailure("Unable to append a video frame to MP4.")
+                }
+                videoIndex += 1
+            } else {
                 Thread.sleep(forTimeInterval: 0.002)
             }
-            let copy = try rebasedSample(sample, offset: offset)
-            guard input.append(copy) else { throw writer.error ?? MediaFailure("Unable to append a video frame to MP4.") }
         }
-        input.markAsFinished()
+        if !videoFinished { input.markAsFinished() }
+        if !audioFinished { audioInput?.markAsFinished() }
+        writer.endSession(atSourceTime: CMTimeSubtract(end, offset))
         let completion = DispatchSemaphore(value: 0)
         writer.finishWriting { completion.signal() }
         let remaining = max(0, min(30.0, deadline - ProcessInfo.processInfo.systemUptime))
@@ -525,7 +825,7 @@ public func optic_generate_test_video(_ generation: UInt64, _ frames: @escaping 
         let width = 640, height = 360
         let encoder = try H264Encoder(width: width, height: height, gate: gate)
         defer { try? encoder.finish() }
-        for frame in 0..<90 {
+        for frame in 0..<180 {
             try autoreleasepool {
                 var pixelBuffer: CVPixelBuffer?
                 try check(CVPixelBufferCreate(kCFAllocatorDefault, width, height,
@@ -547,7 +847,7 @@ public func optic_generate_test_video(_ generation: UInt64, _ frames: @escaping 
                     }
                 }
                 CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-                try encoder.encode(pixelBuffer, at: CMTime(value: Int64(frame), timescale: 30))
+                try encoder.encode(pixelBuffer, at: CMTime(value: Int64(frame), timescale: captureFrameRate))
             }
         }
         try encoder.finish()
@@ -555,6 +855,72 @@ public func optic_generate_test_video(_ generation: UInt64, _ frames: @escaping 
     } catch {
         gate.disable()
         writeError(error, operation: "Generating the test video failed", to: errorBuffer, capacity: errorCapacity)
+        return false
+    }
+}
+
+// Three seconds of stereo PCM alternate tone, silence, and tone. The timestamps
+// share the synthetic video's zero origin without accessing an audio device.
+@_cdecl("optic_generate_test_audio")
+public func optic_generate_test_audio(_ generation: UInt64, _ audio: @escaping AudioCallback,
+                                      _ errorBuffer: UnsafeMutablePointer<CChar>?,
+                                      _ errorCapacity: Int) -> Bool {
+    if let errorBuffer, errorCapacity > 0 { errorBuffer[0] = 0 }
+    let gate = AudioGate(generation: generation, callback: audio)
+    do {
+        var description = AudioStreamBasicDescription(
+            mSampleRate: Double(audioSampleRate), mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
+        var format: CMAudioFormatDescription?
+        try check(CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &description,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format), "Creating test audio format")
+        guard let format else { throw MediaFailure("Unable to create the test audio format.") }
+        let framesPerPacket = 960
+        for packet in 0..<150 {
+            try autoreleasepool {
+                var pcm = [Int16](repeating: 0, count: framesPerPacket * 2)
+                let startFrame = packet * framesPerPacket
+                for frame in 0..<framesPerPacket {
+                    let index = startFrame + frame
+                    if index < audioSampleRate || index >= audioSampleRate * 2 {
+                        let seconds = Double(index) / Double(audioSampleRate)
+                        let value = Int16(sin(2.0 * .pi * 440.0 * seconds) * 8_192.0)
+                        pcm[frame * 2] = value
+                        pcm[frame * 2 + 1] = value
+                    }
+                }
+                let length = pcm.count * MemoryLayout<Int16>.size
+                var block: CMBlockBuffer?
+                try check(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+                    memoryBlock: nil, blockLength: length, blockAllocator: kCFAllocatorDefault,
+                    customBlockSource: nil, offsetToData: 0, dataLength: length, flags: 0,
+                    blockBufferOut: &block), "Allocating test audio storage")
+                guard let block else { throw MediaFailure("Unable to allocate test audio storage.") }
+                try pcm.withUnsafeBytes { bytes in
+                    guard let base = bytes.baseAddress else { throw MediaFailure("The test audio has no PCM data.") }
+                    try check(CMBlockBufferReplaceDataBytes(with: base, blockBuffer: block,
+                        offsetIntoDestination: 0, dataLength: length), "Copying test PCM audio")
+                }
+                var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: Int32(audioSampleRate)),
+                    presentationTimeStamp: CMTime(value: Int64(startFrame), timescale: Int32(audioSampleRate)),
+                    decodeTimeStamp: .invalid)
+                var sampleSize = 4
+                var sample: CMSampleBuffer?
+                try check(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
+                    formatDescription: format, sampleCount: framesPerPacket, sampleTimingEntryCount: 1,
+                    sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
+                    sampleBufferOut: &sample), "Creating test PCM audio")
+                guard let sample else { throw MediaFailure("Unable to create a test PCM sample.") }
+                gate.deliver(sample)
+            }
+        }
+        return true
+    } catch {
+        gate.disable()
+        writeError(error, operation: "Generating test audio failed", to: errorBuffer, capacity: errorCapacity)
         return false
     }
 }

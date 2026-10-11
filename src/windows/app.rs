@@ -1347,17 +1347,17 @@ impl Application {
             WM_ENDSESSION => self.end_session(wparam.0 != 0),
             WM_POWERBROADCAST => {
                 if wparam.0 == PBT_APMSUSPEND as usize {
-                    interrupt_capture();
+                    interrupt_capture(super::capture::Interruption::Expected);
                 }
                 return Some(LRESULT(1));
             }
             WM_WTSSESSION_CHANGE => {
                 if matches!(wparam.0, 7 | 2 | 4) {
-                    interrupt_capture();
+                    interrupt_capture(super::capture::Interruption::Expected);
                 }
             }
             WM_DISPLAYCHANGE => {
-                interrupt_capture();
+                interrupt_capture(super::capture::Interruption::DisplayChanged);
                 self.update_icon();
             }
             WM_DPICHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED => self.update_icon(),
@@ -1395,11 +1395,16 @@ impl Drop for Application {
     }
 }
 
-fn interrupt_capture() {
+fn interrupt_capture(reason: super::capture::Interruption) {
     #[cfg(not(test))]
-    super::capture::interrupt();
+    super::capture::interrupt(reason);
     #[cfg(test)]
-    tests::INTERRUPTIONS.fetch_add(1, Ordering::AcqRel);
+    {
+        tests::INTERRUPTIONS.fetch_add(1, Ordering::AcqRel);
+        if reason == super::capture::Interruption::DisplayChanged {
+            tests::DISPLAY_INTERRUPTION.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -1743,6 +1748,7 @@ mod tests {
     static SAVES: AtomicUsize = AtomicUsize::new(0);
     static QUITS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static INTERRUPTIONS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DISPLAY_INTERRUPTION: AtomicUsize = AtomicUsize::new(0);
     static DEFER_QUIT: AtomicBool = AtomicBool::new(true);
     static SAVING: AtomicBool = AtomicBool::new(false);
     static ERRORS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
@@ -1957,6 +1963,7 @@ mod tests {
         post(window, WM_DISPLAYCHANGE, 0, 0);
         invoke(window, |_| {
             assert_eq!(INTERRUPTIONS.load(Ordering::Acquire), 3);
+            assert_eq!(DISPLAY_INTERRUPTION.load(Ordering::Acquire), 1);
         });
         SAVING.store(true, Ordering::Release);
         let mut query_result = 1;

@@ -1,4 +1,4 @@
-//! Optic records a bounded history of screen video on macOS and Windows.
+//! Optic records recent screen video and system playback audio on macOS and Windows.
 //!
 //! The Rust replay buffer owns compressed samples and save snapshots; the
 //! Windows services use Rust; macOS capture and UI use a native Swift bridge.

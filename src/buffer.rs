@@ -130,9 +130,78 @@ impl<T: Clone> ReplayBuffer<T> {
     }
 }
 
+/// A packet of uncompressed playback audio on the video capture timeline.
+#[derive(Clone)]
+pub struct AudioFrame<T> {
+    pub sample: T,
+    pub pts: f64,
+    pub duration: f64,
+    pub size: usize,
+}
+
+/// Audio has no keyframe boundary; retain packets by elapsed time instead.
+pub struct AudioBuffer<T> {
+    packets: VecDeque<AudioFrame<T>>,
+    max_seconds: f64,
+}
+
+impl<T> AudioBuffer<T> {
+    pub const fn new(max_seconds: f64) -> Self {
+        Self {
+            packets: VecDeque::new(),
+            max_seconds,
+        }
+    }
+
+    pub fn push(&mut self, packet: AudioFrame<T>) {
+        let end = packet.pts + packet.duration;
+        if !self.max_seconds.is_finite()
+            || self.max_seconds <= 0.0
+            || !packet.pts.is_finite()
+            || !packet.duration.is_finite()
+            || packet.duration <= 0.0
+            || !end.is_finite()
+            || packet.size == 0
+        {
+            return;
+        }
+        if self
+            .packets
+            .back()
+            .is_some_and(|last| packet.pts < last.pts)
+        {
+            self.clear();
+        }
+        let cutoff = end - self.max_seconds;
+        self.packets.push_back(packet);
+        while self
+            .packets
+            .front()
+            .is_some_and(|first| first.pts + first.duration <= cutoff)
+        {
+            self.packets.pop_front();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.packets.clear();
+    }
+}
+
+impl<T: Clone> AudioBuffer<T> {
+    /// Export performs sample-accurate trimming of the edge packets.
+    pub fn snapshot_between(&self, start: f64, end: f64) -> Vec<AudioFrame<T>> {
+        self.packets
+            .iter()
+            .filter(|packet| packet.pts < end && packet.pts + packet.duration > start)
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Frame, ReplayBuffer};
+    use super::{AudioBuffer, AudioFrame, Frame, ReplayBuffer};
     use std::{cell::Cell, rc::Rc};
 
     fn frame(pts: f64, keyframe: bool, size: usize) -> Frame<u64> {
@@ -142,6 +211,62 @@ mod tests {
             duration: 1.0,
             size,
             keyframe,
+        }
+    }
+
+    fn audio(pts: f64) -> AudioFrame<u64> {
+        AudioFrame {
+            sample: pts.to_bits(),
+            pts,
+            duration: 1.0,
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn audio_snapshot_keeps_overlapping_edges_and_survives_clear() {
+        let mut buffer = AudioBuffer::new(3.0);
+        for second in 0..4 {
+            buffer.push(audio(f64::from(second)));
+        }
+        // The packet ending at 1s has expired; edge packets overlap the clip.
+        let snapshot = buffer.snapshot_between(1.5, 3.5);
+        assert_eq!(
+            snapshot.iter().map(|packet| packet.pts).collect::<Vec<_>>(),
+            vec![1.0, 2.0, 3.0]
+        );
+        buffer.clear();
+        assert!(buffer.snapshot_between(0.0, 10.0).is_empty());
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot[0].sample, 1.0_f64.to_bits());
+        buffer.push(audio(8.0));
+        assert_eq!(snapshot[2].pts, 3.0);
+    }
+
+    #[test]
+    fn audio_rejects_invalid_packets_and_resets_on_a_new_timeline() {
+        let mut buffer = AudioBuffer::new(3.0);
+        buffer.push(audio(10.0));
+        for pts in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            buffer.push(audio(pts));
+        }
+        let mut empty = audio(11.0);
+        empty.size = 0;
+        buffer.push(empty);
+        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = audio(11.0);
+            invalid.duration = duration;
+            buffer.push(invalid);
+        }
+        assert_eq!(buffer.snapshot_between(0.0, 20.0).len(), 1);
+        buffer.push(audio(0.0));
+        let snapshot = buffer.snapshot_between(0.0, 20.0);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].pts, 0.0);
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = AudioBuffer::new(seconds);
+            invalid.push(audio(0.0));
+            assert!(invalid.snapshot_between(0.0, 20.0).is_empty());
         }
     }
 

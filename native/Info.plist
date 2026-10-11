@@ -13,7 +13,7 @@
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Optic buffers recent screen video locally so you can save a clip with a shortcut.</string>
+    <string>Optic buffers recent screen video and system playback audio locally so you can save a clip with a shortcut.</string>
 </dict>
 </plist>
 

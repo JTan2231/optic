@@ -5,11 +5,13 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
+pub use crate::windows::media::AudioSample;
+#[cfg(target_os = "windows")]
 pub use crate::windows::media::EncodedSample as Sample;
 #[cfg(target_os = "windows")]
 pub use crate::windows::{
     app::{finish_quit, prepare_console, recordings_folder, run, set_status, shutdown},
-    capture::{start as capture_start, stop as capture_stop},
+    capture::stop as capture_stop,
     FrameCallback,
 };
 
@@ -17,14 +19,63 @@ pub use crate::windows::{
 pub const fn initialize_error_reporting() {}
 
 #[cfg(target_os = "windows")]
+pub fn capture_start(
+    generation: u64,
+    frame: FrameCallback,
+    audio: crate::windows::AudioCallback,
+    event: crate::windows::EventCallback,
+) {
+    crate::windows::capture::start_with_audio(generation, frame, audio, event);
+}
+
+#[cfg(target_os = "windows")]
 pub fn generate_test_video(generation: u64, callback: FrameCallback) -> Result<(), String> {
     crate::windows::media::generate_test_video(generation, std::sync::Arc::new(callback))
 }
 
 #[cfg(target_os = "windows")]
-pub fn export_samples(samples: &[&Sample], path: &Path) -> Result<(), String> {
+pub fn generate_test_audio(
+    generation: u64,
+    callback: crate::windows::AudioCallback,
+) -> Result<(), String> {
+    for packet in 0..30_i64 {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(19_200)
+            .map_err(|error| error.to_string())?;
+        for frame in 0..4800 {
+            // One second of tone, one second of silence, then tone again.
+            let value: i16 = if packet / 10 == 1 {
+                0
+            } else if frame % 48 < 24 {
+                8000
+            } else {
+                -8000
+            };
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        callback(
+            generation,
+            AudioSample {
+                bytes: bytes.into(),
+                pts: packet * 1_000_000,
+                duration: 1_000_000,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn export_samples(
+    samples: &[&Sample],
+    audio: &[&AudioSample],
+    path: &Path,
+) -> Result<(), String> {
     let samples: Vec<Sample> = samples.iter().map(|sample| (*sample).clone()).collect();
-    crate::windows::media::export_samples(&samples, path)
+    let audio: Vec<AudioSample> = audio.iter().map(|sample| (*sample).clone()).collect();
+    crate::windows::media::export_samples_with_audio(&samples, &audio, path)
 }
 
 #[cfg(target_os = "macos")]
@@ -36,6 +87,7 @@ mod macos {
     use std::ffi::{c_char, c_void, CStr, CString};
 
     pub type FrameCallback = extern "C" fn(u64, *mut c_void, f64, f64, usize, bool);
+    pub type AudioCallback = extern "C" fn(u64, *mut c_void, f64, f64, usize);
     pub type EventCallback = extern "C" fn(u64, i32, *const c_char);
     type ErrorCallback = extern "C" fn(*const c_char, *const c_char, *const c_char);
 
@@ -44,12 +96,19 @@ mod macos {
         fn optic_run(callback: extern "C" fn(i32) -> bool);
         fn optic_finish_quit();
         fn optic_set_status(state: i32, message: *const c_char);
-        fn optic_capture_start(generation: u64, frame: FrameCallback, event: EventCallback);
+        fn optic_capture_start(
+            generation: u64,
+            frame: FrameCallback,
+            audio: AudioCallback,
+            event: EventCallback,
+        );
         fn optic_capture_stop(generation: u64);
         fn optic_sample_release(sample: *mut c_void);
         fn optic_export(
             samples: *const *mut c_void,
             count: usize,
+            audio: *const *mut c_void,
+            audio_count: usize,
             path: *const c_char,
             error: *mut c_char,
             error_capacity: usize,
@@ -60,13 +119,21 @@ mod macos {
             error: *mut c_char,
             error_capacity: usize,
         ) -> bool;
+        fn optic_generate_test_audio(
+            generation: u64,
+            audio: AudioCallback,
+            error: *mut c_char,
+            error_capacity: usize,
+        ) -> bool;
     }
 
-    /// Owns the retained immutable CoreMedia sample supplied by Swift.
+    /// Owns the retained immutable `CoreMedia` sample supplied by Swift.
     pub struct Sample(*mut c_void);
 
+    pub type AudioSample = Sample;
+
     impl Sample {
-        /// Takes ownership of the retained CoreMedia sample passed by Swift.
+        /// Takes ownership of the retained `CoreMedia` sample passed by Swift.
         ///
         /// # Safety
         /// The non-null pointer must own one immutable retained sample reference
@@ -75,7 +142,7 @@ mod macos {
             Self(pointer)
         }
     }
-    // SAFETY: Swift supplies immutable compressed samples whose retained
+    // SAFETY: Swift supplies immutable video and PCM audio samples whose retained
     // references may be transferred to and released on an export worker.
     unsafe impl Send for Sample {}
     // SAFETY: Shared references borrow immutable data kept alive by this owner.
@@ -130,9 +197,14 @@ mod macos {
         }
     }
 
-    pub fn capture_start(generation: u64, frame: FrameCallback, event: EventCallback) {
+    pub fn capture_start(
+        generation: u64,
+        frame: FrameCallback,
+        audio: AudioCallback,
+        event: EventCallback,
+    ) {
         // SAFETY: The C ABI callbacks have static lifetime and accept retained samples.
-        unsafe { optic_capture_start(generation, frame, event) };
+        unsafe { optic_capture_start(generation, frame, audio, event) };
     }
 
     pub fn capture_stop(generation: u64) {
@@ -145,10 +217,15 @@ mod macos {
         Ok(PathBuf::from(home).join("Movies/Optic"))
     }
 
-    pub fn export_samples(samples: &[&Sample], path: &Path) -> Result<(), String> {
+    pub fn export_samples(
+        samples: &[&Sample],
+        audio: &[&AudioSample],
+        path: &Path,
+    ) -> Result<(), String> {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "Invalid output path")?;
         let pointers: Vec<*mut c_void> = samples.iter().map(|sample| sample.0).collect();
+        let audio_pointers: Vec<*mut c_void> = audio.iter().map(|sample| sample.0).collect();
         let mut error = [0; 2048];
         // SAFETY: All owners remain borrowed throughout export; the path is
         // terminated and the error buffer is writable for its supplied length.
@@ -156,6 +233,8 @@ mod macos {
             optic_export(
                 pointers.as_ptr(),
                 pointers.len(),
+                audio_pointers.as_ptr(),
+                audio_pointers.len(),
                 path.as_ptr(),
                 error.as_mut_ptr(),
                 error.len(),
@@ -172,6 +251,18 @@ mod macos {
         // SAFETY: Callback is static and receives retained samples; error is writable.
         if unsafe {
             optic_generate_test_video(generation, callback, error.as_mut_ptr(), error.len())
+        } {
+            Ok(())
+        } else {
+            Err(bridge_error(&error))
+        }
+    }
+
+    pub fn generate_test_audio(generation: u64, callback: AudioCallback) -> Result<(), String> {
+        let mut error = [0; 2048];
+        // SAFETY: The callback accepts retained immutable PCM samples; error is writable.
+        if unsafe {
+            optic_generate_test_audio(generation, callback, error.as_mut_ptr(), error.len())
         } {
             Ok(())
         } else {

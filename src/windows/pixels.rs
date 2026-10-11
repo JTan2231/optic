@@ -55,6 +55,85 @@ fn resize_image(destination: &mut Vec<u8>, width: usize, height: usize) -> Resul
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Viewport {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Fits the full desktop into a fixed canvas without cropping or stretching it.
+pub(super) fn fit_viewport(
+    source_width: usize,
+    source_height: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+) -> Result<Viewport, String> {
+    if [source_width, source_height, canvas_width, canvas_height]
+        .into_iter()
+        .any(|dimension| dimension == 0 || dimension > 32768)
+    {
+        return Err("Invalid image fitting dimensions.".into());
+    }
+    let width_product = source_width
+        .checked_mul(canvas_height)
+        .ok_or("The image fitting dimensions are too large.")?;
+    let height_product = source_height
+        .checked_mul(canvas_width)
+        .ok_or("The image fitting dimensions are too large.")?;
+    let (width, height) = if width_product > height_product {
+        (canvas_width, (height_product / source_width).max(1))
+    } else {
+        ((width_product / source_height).max(1), canvas_height)
+    };
+    Ok(Viewport {
+        x: (canvas_width - width) / 2,
+        y: (canvas_height - height) / 2,
+        width,
+        height,
+    })
+}
+
+/// Places a tightly packed BGRA image into a canvas with opaque black bars.
+pub(super) fn fit_scaled_desktop(
+    scaled: &[u8],
+    viewport: Viewport,
+    canvas_width: usize,
+    canvas_height: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    if canvas_width > 32768
+        || canvas_height > 32768
+        || viewport
+            .x
+            .checked_add(viewport.width)
+            .is_none_or(|right| right > canvas_width)
+        || viewport
+            .y
+            .checked_add(viewport.height)
+            .is_none_or(|bottom| bottom > canvas_height)
+    {
+        return Err("Invalid image fitting coordinates.".into());
+    }
+    if scaled.len() != image_len(viewport.width, viewport.height)? {
+        return Err("Invalid fitted image data.".into());
+    }
+    resize_image(output, canvas_width, canvas_height)?;
+    if viewport.width == canvas_width && viewport.height == canvas_height {
+        output.copy_from_slice(scaled);
+        return Ok(());
+    }
+    output.as_chunks_mut::<4>().0.fill([0, 0, 0, 255]);
+    let canvas_row_bytes = canvas_width * 4;
+    let viewport_row_bytes = viewport.width * 4;
+    for (row, source) in scaled.chunks_exact(viewport_row_bytes).enumerate() {
+        let offset = (viewport.y + row) * canvas_row_bytes + viewport.x * 4;
+        output[offset..offset + viewport_row_bytes].copy_from_slice(source);
+    }
+    Ok(())
+}
+
 pub(super) fn rotate_desktop(
     source: &[u8],
     stride: usize,
@@ -404,6 +483,173 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aspect_fit_keeps_the_desktop_centered() -> Result<(), String> {
+        for (source_width, source_height, canvas_width, canvas_height, expected) in [
+            (
+                1920,
+                1080,
+                1280,
+                720,
+                Viewport {
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 720,
+                },
+            ),
+            (
+                1920,
+                1080,
+                101,
+                101,
+                Viewport {
+                    x: 0,
+                    y: 22,
+                    width: 101,
+                    height: 56,
+                },
+            ),
+            (
+                1080,
+                1920,
+                1920,
+                1080,
+                Viewport {
+                    x: 656,
+                    y: 0,
+                    width: 607,
+                    height: 1080,
+                },
+            ),
+            (
+                1,
+                32768,
+                32768,
+                1,
+                Viewport {
+                    x: 16383,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ),
+            (
+                32768,
+                1,
+                1,
+                32768,
+                Viewport {
+                    x: 0,
+                    y: 16383,
+                    width: 1,
+                    height: 1,
+                },
+            ),
+        ] {
+            assert_eq!(
+                fit_viewport(source_width, source_height, canvas_width, canvas_height)?,
+                expected
+            );
+        }
+        for dimensions in [
+            (0, 1, 1, 1),
+            (1, 0, 1, 1),
+            (1, 1, 0, 1),
+            (1, 1, 1, 0),
+            (usize::MAX, 1, 1, 1),
+            (1, 1, 32769, 1),
+        ] {
+            assert!(fit_viewport(dimensions.0, dimensions.1, dimensions.2, dimensions.3).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fitted_canvas_bars_are_black_and_old_pixels_are_replaced() -> Result<(), String> {
+        let scaled = [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        let mut output = vec![99; image_len(5, 2)?];
+        let viewport = fit_viewport(2, 2, 5, 2)?;
+        fit_scaled_desktop(&scaled, viewport, 5, 2, &mut output)?;
+        assert_eq!(
+            output.as_chunks::<4>().0,
+            &[
+                [0, 0, 0, 255],
+                [1, 2, 3, 255],
+                [4, 5, 6, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [7, 8, 9, 255],
+                [10, 11, 12, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+            ]
+        );
+        fit_scaled_desktop(&scaled, fit_viewport(2, 2, 2, 2)?, 2, 2, &mut output)?;
+        assert_eq!(output, scaled);
+        let horizontal = [20, 21, 22, 255, 30, 31, 32, 255];
+        fit_scaled_desktop(&horizontal, fit_viewport(2, 1, 2, 4)?, 2, 4, &mut output)?;
+        assert_eq!(
+            output.as_chunks::<4>().0,
+            &[
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [20, 21, 22, 255],
+                [30, 31, 32, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fitted_canvas_rejects_invalid_data_without_changing_output() {
+        let mut output = vec![9; 4];
+        for viewport in [
+            Viewport {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1,
+            },
+            Viewport {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            Viewport {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
+            Viewport {
+                x: usize::MAX,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            assert!(fit_scaled_desktop(&[1; 4], viewport, 1, 1, &mut output).is_err());
+            assert_eq!(output, [9; 4]);
+        }
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert!(fit_scaled_desktop(&[1; 3], viewport, 1, 1, &mut output).is_err());
+        assert!(fit_scaled_desktop(&[1; 4], viewport, 32769, 1, &mut output).is_err());
+        assert!(fit_scaled_desktop(&[1; 4], viewport, 0, 1, &mut output).is_err());
+        assert_eq!(output, [9; 4]);
+    }
+
+    #[test]
     fn rotation_and_padded_rows() -> Result<(), String> {
         let image = [
             1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 0, 0, 0, 0, 4, 4, 4, 255, 5, 5, 5, 255, 6, 6,
@@ -558,7 +804,7 @@ mod tests {
                 std::hint::black_box(&output);
             }
             let mean = started.elapsed().as_secs_f64() * 1000.0 / 30.0;
-            println!("4K -> 1080p scaling SIMD={simd}: {mean:.3} ms/frame (30fps total budget 33.333 ms)");
+            println!("4K -> 1080p scaling SIMD={simd}: {mean:.3} ms/frame");
         }
         Ok(())
     }
