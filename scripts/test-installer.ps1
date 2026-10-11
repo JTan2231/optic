@@ -5,8 +5,8 @@ Runs opt-in Windows installer smoke checks without capturing the screen.
 .DESCRIPTION
 Temporarily creates real per-user Installed apps, Start menu, and startup entries.
 Refuses to run if Optic is already installed, running, or has these entries.
-Installs under target/installer-smoke, then uninstalls. Logs and a synthetic MP4
-fixture remain there for review. The Videos recording folder is never touched.
+Installs under target/installer-smoke, then uninstalls. Logs and synthetic MP4/M4A
+fixtures remain there for review. The Videos recording folder is never touched.
 #>
 [CmdletBinding()]
 param([string] $InstallerPath)
@@ -113,6 +113,7 @@ $installDirectory = Join-Path $workspace 'app'
 $installedExe = Join-Path $installDirectory 'Optic.exe'
 $uninstaller = Join-Path $installDirectory 'unins000.exe'
 $clip = Join-Path $installDirectory 'preserved-self-test.mp4'
+$fixtures = @($clip, [IO.Path]::ChangeExtension($clip, '.m4a'))
 $script:logIndex = 0
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $transcript = Join-Path $workspace 'smoke.log'
@@ -218,10 +219,13 @@ try {
 
     # Synthetic media only: no desktop capture or changes to the Videos folder.
     Wait-Success (Start-HiddenProcess -FilePath $installedExe -Arguments @('--self-test', $clip)) -TimeoutSeconds 90
-    if (-not (Test-Path -LiteralPath $clip -PathType Leaf) -or (Get-Item -LiteralPath $clip).Length -eq 0) {
-        throw 'The synthetic MP4 fixture was not created.'
+    $fixtureHashes = @{}
+    foreach ($fixture in $fixtures) {
+        if (-not (Test-Path -LiteralPath $fixture -PathType Leaf) -or (Get-Item -LiteralPath $fixture).Length -eq 0) {
+            throw "The synthetic media fixture was not created: $fixture"
+        }
+        $fixtureHashes[$fixture] = (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
     }
-    $clipHash = (Get-FileHash -LiteralPath $clip -Algorithm SHA256).Hash
 
     $app = Start-TestApp
     $duplicate = Start-HiddenProcess -FilePath $installedExe
@@ -242,7 +246,11 @@ try {
     Assert-Startup -Enabled $false
     Invoke-Setup
     Assert-Startup -Enabled $false
-    if ((Get-FileHash -LiteralPath $clip -Algorithm SHA256).Hash -ne $clipHash) { throw 'An upgrade changed the synthetic clip.' }
+    foreach ($fixture in $fixtures) {
+        if (-not (Test-Path -LiteralPath $fixture -PathType Leaf) -or (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash -ne $fixtureHashes[$fixture]) {
+            throw 'An upgrade deleted or changed a synthetic media fixture.'
+        }
+    }
     Write-Host 'PASS: running-app upgrade and remembered startup opt-in and opt-out.'
 
     $app = Start-TestApp
@@ -256,14 +264,16 @@ try {
     }
     if (Test-Path -LiteralPath $shortcut) { throw 'The Start menu shortcut remains after uninstall.' }
     Assert-Startup -Enabled $false
-    if (-not (Test-Path -LiteralPath $clip) -or (Get-FileHash -LiteralPath $clip -Algorithm SHA256).Hash -ne $clipHash) {
-        throw 'Uninstall deleted or changed an untracked synthetic clip.'
+    foreach ($fixture in $fixtures) {
+        if (-not (Test-Path -LiteralPath $fixture -PathType Leaf) -or (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash -ne $fixtureHashes[$fixture]) {
+            throw 'Uninstall deleted or changed an untracked synthetic media fixture.'
+        }
     }
-    Write-Host 'PASS: running-app uninstall removes integration and preserves an untracked synthetic clip.'
+    Write-Host 'PASS: running-app uninstall removes integration and preserves untracked synthetic MP4 and M4A fixtures.'
     Write-Host 'The Videos recording folder was never touched. These checks do not exercise active screen capture or a save in progress.'
 }
 finally {
-    # Clean up only the install created in this exact workspace. Keep logs/clip.
+    # Clean up only the install created in this exact workspace. Keep logs/fixtures.
     $record = Get-InstallRecord
     if ($record -and [string]::Equals(([string] $record.InstallLocation).TrimEnd('\'), $installDirectory, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
         try { Invoke-Uninstall }

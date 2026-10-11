@@ -3,6 +3,7 @@ import AudioToolbox
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import Darwin
 import Foundation
 import ScreenCaptureKit
 import VideoToolbox
@@ -660,7 +661,58 @@ private func trimmedAudioSample(_ sample: CMSampleBuffer, start: CMTime,
     return copy
 }
 
+private func writeExportTrack(_ samples: [CMSampleBuffer], input: AVAssetWriterInput,
+                              url: URL, fileType: AVFileType, duration: CMTime,
+                              label: String, deadline: TimeInterval) throws {
+    let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
+    defer {
+        if writer.status != .completed { writer.cancelWriting() }
+    }
+    input.expectsMediaDataInRealTime = false
+    guard writer.canAdd(input) else { throw MediaFailure("Unable to add the \(label) track.") }
+    writer.add(input)
+    guard writer.startWriting() else { throw writer.error ?? MediaFailure("Unable to start writing \(label).") }
+    writer.startSession(atSourceTime: .zero)
+    for sample in samples {
+        while !input.isReadyForMoreMediaData {
+            guard writer.status == .writing else {
+                throw writer.error ?? MediaFailure("The \(label) writer stopped unexpectedly.")
+            }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw MediaFailure("Writing \(label) timed out.")
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        guard writer.status == .writing else {
+            throw writer.error ?? MediaFailure("The \(label) writer stopped unexpectedly.")
+        }
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+            throw MediaFailure("Writing \(label) timed out.")
+        }
+        guard input.append(sample) else {
+            throw writer.error ?? MediaFailure("Unable to append a \(label) sample.")
+        }
+    }
+    input.markAsFinished()
+    writer.endSession(atSourceTime: duration)
+    let completion = DispatchSemaphore(value: 0)
+    writer.finishWriting { completion.signal() }
+    let remaining = max(0, min(30.0, deadline - ProcessInfo.processInfo.systemUptime))
+    guard completion.wait(timeout: .now() + remaining) == .success else {
+        throw MediaFailure("Finalizing \(label) timed out.")
+    }
+    guard writer.status == .completed else {
+        throw writer.error ?? MediaFailure("The \(label) file could not be finalized.")
+    }
+}
+
+private func publishExport(_ staged: URL, to output: URL) throws {
+    // Foundation refuses an existing destination without requiring filesystem-specific rename support.
+    try FileManager.default.moveItem(at: staged, to: output)
+}
+
 // Synchronous worker API. The caller keeps every sample alive until this function returns.
+// The supplied path receives video-only MP4; audio, when present, receives a companion M4A.
 @_cdecl("optic_export")
 public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _ count: Int,
                          _ audioPointers: UnsafePointer<UnsafeMutableRawPointer?>?, _ audioCount: Int,
@@ -669,9 +721,13 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
     if let errorBuffer, errorCapacity > 0 { errorBuffer[0] = 0 }
     do {
         guard let pointers, count > 0, let path else { throw MediaFailure("No video frames or output path supplied.") }
-        let url = URL(fileURLWithPath: String(cString: path))
-        guard !FileManager.default.fileExists(atPath: url.path) else {
-            throw MediaFailure("The output file already exists.")
+        let videoURL = URL(fileURLWithPath: String(cString: path)).standardizedFileURL
+        let audioURL = videoURL.deletingPathExtension().appendingPathExtension("m4a")
+        guard videoURL.path.caseInsensitiveCompare(audioURL.path) != .orderedSame else {
+            throw MediaFailure("The video and audio output paths must be different.")
+        }
+        guard !FileManager.default.fileExists(atPath: videoURL.path) else {
+            throw MediaFailure("The video output file already exists.")
         }
         var samples: [CMSampleBuffer] = []
         samples.reserveCapacity(count)
@@ -706,38 +762,14 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
                 guard let pointer = audioPointers[index] else { throw MediaFailure("An audio sample is missing.") }
                 let sample = Unmanaged<CMSampleBuffer>.fromOpaque(pointer).takeUnretainedValue()
                 if let trimmed = try trimmedAudioSample(sample, start: audioCursor, end: end) {
-                    audioSamples.append(try rebasedSample(trimmed, offset: offset))
+                    audioSamples.append(trimmed)
                     audioCursor = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(trimmed),
                                             CMSampleBufferGetDuration(trimmed))
                 }
             }
         }
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        var succeeded = false
-        defer {
-            if !succeeded {
-                writer.cancelWriting()
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
-        input.expectsMediaDataInRealTime = false
-        guard writer.canAdd(input) else { throw MediaFailure("Unable to write this H.264 format to MP4.") }
-        writer.add(input)
-        var audioInput: AVAssetWriterInput?
-        if let firstAudio = audioSamples.first {
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: audioSampleRate,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 192_000
-            ]
-            let candidate = AVAssetWriterInput(mediaType: .audio, outputSettings: settings,
-                                               sourceFormatHint: CMSampleBufferGetFormatDescription(firstAudio))
-            candidate.expectsMediaDataInRealTime = false
-            guard writer.canAdd(candidate) else { throw MediaFailure("Unable to add AAC audio to MP4.") }
-            writer.add(candidate)
-            audioInput = candidate
+        if !audioSamples.isEmpty, FileManager.default.fileExists(atPath: audioURL.path) {
+            throw MediaFailure("The audio output file already exists.")
         }
         var videoSamples: [CMSampleBuffer] = []
         videoSamples.reserveCapacity(samples.count)
@@ -754,62 +786,68 @@ public func optic_export(_ pointers: UnsafePointer<UnsafeMutableRawPointer?>?, _
             previousPTS = pts
             videoSamples.append(try rebasedSample(sample, offset: offset))
         }
-        guard writer.startWriting() else { throw writer.error ?? MediaFailure("Unable to start writing the MP4 file.") }
-        writer.startSession(atSourceTime: .zero)
+        var audioDuration: CMTime?
+        if let firstAudio = audioSamples.first, let finalAudio = audioSamples.last {
+            let audioOffset = CMSampleBufferGetPresentationTimeStamp(firstAudio)
+            let finalAudioDuration = CMSampleBufferGetDuration(finalAudio)
+            let audioEnd = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(finalAudio), finalAudioDuration)
+            guard audioOffset.isNumeric, finalAudioDuration.isNumeric,
+                  CMTimeCompare(finalAudioDuration, .zero) > 0, audioEnd.isNumeric,
+                  CMTimeCompare(audioEnd, audioOffset) > 0 else {
+                throw MediaFailure("The audio snapshot has invalid timing.")
+            }
+            // Each output has its own zero origin. Retain the captured gaps between audio packets.
+            audioSamples = try audioSamples.map { try rebasedSample($0, offset: audioOffset) }
+            audioDuration = CMTimeSubtract(audioEnd, audioOffset)
+        }
+
+        // A private, exclusively created directory makes every staged path ours to clean up.
+        let stagingURL = videoURL.deletingLastPathComponent()
+            .appendingPathComponent(".optic-export-\(UUID().uuidString)", isDirectory: true)
+        let directoryStatus = stagingURL.path.withCString { mkdir($0, 0o700) }
+        guard directoryStatus == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var published: [URL] = []
+        var succeeded = false
+        defer {
+            if !succeeded {
+                for output in published { try? FileManager.default.removeItem(at: output) }
+            }
+            try? FileManager.default.removeItem(at: stagingURL)
+        }
         let deadline = ProcessInfo.processInfo.systemUptime + 60.0
-        var videoIndex = 0, audioIndex = 0
-        var videoFinished = false, audioFinished = audioInput == nil
-        // Prefer chronological writes, but feed the other ready input when
-        // one is backpressured. This also handles audio that starts late or ends
-        // early without making the writer wait indefinitely for the other track.
-        while videoIndex < videoSamples.count || audioIndex < audioSamples.count {
-            if videoIndex == videoSamples.count, !videoFinished {
-                input.markAsFinished()
-                videoFinished = true
-            }
-            if audioIndex == audioSamples.count, !audioFinished {
-                audioInput?.markAsFinished()
-                audioFinished = true
-            }
-            guard writer.status == .writing else {
-                throw writer.error ?? MediaFailure("The MP4 writer stopped unexpectedly.")
-            }
-            guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw MediaFailure("Writing the MP4 timed out.")
-            }
-            let videoReady = videoIndex < videoSamples.count && input.isReadyForMoreMediaData
-            let audioReady = audioIndex < audioSamples.count && (audioInput?.isReadyForMoreMediaData ?? false)
-            let preferAudio = audioIndex < audioSamples.count && (videoIndex == videoSamples.count
-                || CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(audioSamples[audioIndex]),
-                                 CMSampleBufferGetPresentationTimeStamp(videoSamples[videoIndex])) <= 0)
-            if audioReady && (preferAudio || !videoReady), let audioInput {
-                guard audioInput.append(audioSamples[audioIndex]) else {
-                    throw writer.error ?? MediaFailure("Unable to append PCM audio to MP4.")
-                }
-                audioIndex += 1
-            } else if videoReady {
-                guard input.append(videoSamples[videoIndex]) else {
-                    throw writer.error ?? MediaFailure("Unable to append a video frame to MP4.")
-                }
-                videoIndex += 1
-            } else {
-                Thread.sleep(forTimeInterval: 0.002)
-            }
+        let stagedVideo = stagingURL.appendingPathComponent("video.mp4")
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+        try writeExportTrack(videoSamples, input: videoInput, url: stagedVideo, fileType: .mp4,
+                             duration: CMTimeSubtract(end, offset), label: "video MP4", deadline: deadline)
+        var stagedAudio: URL?
+        if let audioDuration, let firstAudio = audioSamples.first {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRate,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192_000
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: settings,
+                                                sourceFormatHint: CMSampleBufferGetFormatDescription(firstAudio))
+            let output = stagingURL.appendingPathComponent("audio.m4a")
+            try writeExportTrack(audioSamples, input: audioInput, url: output, fileType: .m4a,
+                                 duration: audioDuration, label: "audio M4A", deadline: deadline)
+            stagedAudio = output
         }
-        if !videoFinished { input.markAsFinished() }
-        if !audioFinished { audioInput?.markAsFinished() }
-        writer.endSession(atSourceTime: CMTimeSubtract(end, offset))
-        let completion = DispatchSemaphore(value: 0)
-        writer.finishWriting { completion.signal() }
-        let remaining = max(0, min(30.0, deadline - ProcessInfo.processInfo.systemUptime))
-        guard completion.wait(timeout: .now() + remaining) == .success else {
-            throw MediaFailure("Finalizing the MP4 timed out.")
+        guard ProcessInfo.processInfo.systemUptime < deadline else { throw MediaFailure("Exporting the clip timed out.") }
+        try publishExport(stagedVideo, to: videoURL)
+        published.append(videoURL)
+        if let stagedAudio {
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw MediaFailure("Exporting the clip timed out.") }
+            try publishExport(stagedAudio, to: audioURL)
+            published.append(audioURL)
         }
-        guard writer.status == .completed else { throw writer.error ?? MediaFailure("The MP4 file could not be finalized.") }
         succeeded = true
         return true
     } catch {
-        writeError(error, operation: "Exporting the MP4 failed", to: errorBuffer, capacity: errorCapacity)
+        writeError(error, operation: "Exporting the clip failed", to: errorBuffer, capacity: errorCapacity)
         return false
     }
 }

@@ -70,6 +70,7 @@ pub fn generate_test_audio(
 }
 
 #[cfg(target_os = "windows")]
+/// Writes video-only MP4 and, when captured audio is present, a sibling M4A.
 pub fn export_samples(
     samples: &[&Sample],
     audio: &[&AudioSample],
@@ -229,6 +230,7 @@ mod macos {
         Ok(PathBuf::from(home).join("Movies/Optic"))
     }
 
+    /// Writes video-only MP4 and, when captured audio is present, a sibling M4A.
     pub fn export_samples(
         samples: &[&Sample],
         audio: &[&AudioSample],

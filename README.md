@@ -93,11 +93,14 @@ The menu provides the same actions as the global shortcuts:
 | macOS shortcut | Windows shortcut | Action |
 | --- | --- | --- |
 | Control–Option–B | Ctrl+Alt+B | Start buffering; press again to stop and immediately clear history |
-| Control–Option–S | Ctrl+Alt+S | Save the recent buffer as an MP4 while buffering continues |
+| Control–Option–S | Ctrl+Alt+S | Save the recent buffer as separate MP4 video and M4A audio files while buffering continues |
 
 Clips go to `~/Movies/Optic` on macOS, and to `Optic` inside your Videos known
 folder on Windows (normally `%USERPROFILE%\Videos\Optic`; redirected folders
 are respected). Use **Open Recordings Folder** in the menu to find them.
+Each save uses the same timestamp filename stem for its video-only `.mp4` and
+audio-only `.m4a`. Each file plays independently; no audio file is created when
+captured audio is unavailable or empty.
 Saving is disabled when buffering is stopped. If you save shortly after
 starting, the clip contains the history available so far. Stopping does not
 cancel a save that you already requested, and starting again creates fresh
@@ -127,11 +130,11 @@ is used. Capture only starts when you choose Start Buffering or press its shortc
 - Captures the primary display, including the cursor.
 - Keeps approximately the last 30 seconds in memory. Clips may include up to
   one additional keyframe interval, about a second, so they start cleanly.
-- H.264 video in MP4, capped at 60 fps, up to 1080 pixels high, about 8 Mbps.
+- H.264 video in a video-only MP4, capped at 60 fps, up to 1080 pixels high, about 8 Mbps.
   Capture is best effort: missed frames are skipped and elapsed time is preserved.
 - Records the combined audio playing through the current speakers or headphones,
-  using stereo 48 kHz AAC in saved clips. Microphone audio is not captured.
-  Audio is buffered as PCM and encoded when saving; clips remain available if
+  using stereo 48 kHz AAC in a separate M4A file. Microphone audio is not captured.
+  Audio is buffered as PCM and encoded when saving; video remains available if
   audio capture is unavailable. Windows retries unavailable or changed output devices.
 - Compressed video history has a strict 64 MiB payload limit. High bitrate content
   may shorten the retained duration; native frame queues and a save in progress
@@ -144,7 +147,7 @@ is used. Capture only starts when you choose Start Buffering or press its shortc
 - Processes one save at a time. The Windows installer can enable launch at sign-in;
   macOS has no launch-at-login setting yet.
 
-Quitting while a save is active waits for that MP4 to finish before exiting.
+Quitting while a save is active waits for its files to finish before exiting.
 
 The default shortcuts and replay length are currently fixed. If another app
 has claimed a shortcut, Optic shows the registration failure in its menu; the
@@ -200,7 +203,7 @@ require the native build tools described above. macOS lint checks require
 Xcode 16 or newer with `swift-format`. Windows runs validate the Rust backend,
 test the real media pipeline, and build the packaged app.
 Rust tests cover cursor composition/rotation/scaling, tray menu states and
-deferred quitting, complete MP4 decoding, synchronized audio/video export,
+deferred quitting, complete MP4 and M4A decoding, separate audio/video export,
 keyframe trimming, Unicode paths,
 and export failure cleanup. The synthetic checks do not capture your screen.
 Windows lifecycle tests also cover launches from different paths, maintenance
@@ -247,11 +250,11 @@ The unit tests check buffer timing, keyframe boundaries, memory bounds, and
 sample release. The media self-test creates synthetic moving frames, encodes
 them through the platform H.264 encoder, trims them through the Rust replay
 buffer, generates synthetic playback audio with tone and silence, and writes a
-finalized MP4 with remuxed video and AAC audio. It does not capture your screen
+finalized video-only MP4 and a companion AAC M4A. It does not capture your screen
 or playback device, or require Screen Recording permission.
 
 For actual capture, start buffering, wait a few seconds, save, and open the
-result. Stop, start again, and save shortly afterward to confirm the old
+files. Stop, start again, and save shortly afterward to confirm the old
 history was cleared.
 
 Windows live capture tests are opt-in. On an interactive desktop, set
@@ -271,13 +274,13 @@ and verifies the captured PCM in memory; it does not capture the screen or save 
 - `src/app.rs`: start/stop lifecycle, native callbacks, save jobs.
 - `src/logging.rs`: error records, bounded per-process logs, retention, and panic diagnostics.
 - `src/buffer.rs`: compressed video and PCM audio history, independent save snapshots.
-- `native/Media.swift`: capture, encoding, and finalized MP4 export.
+- `native/Media.swift`: capture, encoding, and separate MP4 video and M4A audio export.
 - `native/App.swift`: menu bar and global shortcuts.
 - `src/windows/app.rs`: tray menu, global shortcuts, Videos folder lookup, and maintenance lifecycle.
 - `src/windows/capture.rs`: Desktop Duplication and capture lifecycle.
 - `src/windows/audio.rs`: WASAPI system playback capture and output-device recovery.
 - `src/windows/pixels.rs`: cursor composition, rotation, and scaling.
-- `src/windows/media.rs`: Media Foundation H.264 encoding, immutable samples, and MP4 export.
+- `src/windows/media.rs`: Media Foundation H.264 encoding, immutable samples, and separate MP4 video and M4A audio export.
 - `src/native.rs`: safe platform facade and macOS-only foreign-language bridge.
 - `build.rs`: compiles Windows icon/manifest resources or the macOS Swift bridge.
 - `installer/Optic.iss`: per-user Windows install, upgrades, and uninstall.

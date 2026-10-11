@@ -361,17 +361,27 @@ fn recording_path() -> Result<PathBuf, String> {
     )))
 }
 
+struct SavedRecording {
+    video: PathBuf,
+    audio: Option<PathBuf>,
+}
+
 fn export(
     frames: &[Frame<Arc<Sample>>],
     audio: &[AudioFrame<Arc<AudioSample>>],
     path: &Path,
-) -> Result<(), String> {
+) -> Result<SavedRecording, String> {
     if frames.is_empty() || !frames[0].keyframe {
         return Err("No decodable video buffered yet".into());
     }
     let samples: Vec<&Sample> = frames.iter().map(|frame| frame.sample.as_ref()).collect();
     let audio: Vec<&AudioSample> = audio.iter().map(|packet| packet.sample.as_ref()).collect();
-    native::export_samples(&samples, &audio, path)
+    native::export_samples(&samples, &audio, path)?;
+    let audio_path = path.with_extension("m4a");
+    Ok(SavedRecording {
+        video: path.to_owned(),
+        audio: (!audio.is_empty() && audio_path.is_file()).then_some(audio_path),
+    })
 }
 
 fn save() {
@@ -410,10 +420,7 @@ fn save() {
     let worker = std::thread::Builder::new()
         .name("optic-save".into())
         .spawn(move || {
-            let result = recording_path().and_then(|path| {
-                export(&frames, &audio, &path)?;
-                Ok(path)
-            });
+            let result = recording_path().and_then(|path| export(&frames, &audio, &path));
             // Drop the snapshot before announcing completion. A stopped buffer
             // remains empty; an already requested save owns its own references.
             drop(frames);
@@ -428,7 +435,7 @@ fn save() {
     }
 }
 
-fn finish_save(result: Result<PathBuf, String>, generation: u64) {
+fn finish_save(result: Result<SavedRecording, String>, generation: u64) {
     // Persist errors before locking the recorder or taking the deferred-quit
     // branch. A failed last clip must be reported even when its UI is closing.
     if let Err(error) = &result {
@@ -444,10 +451,19 @@ fn finish_save(result: Result<PathBuf, String>, generation: u64) {
     }
     let saved = result.is_ok();
     match result {
-        Ok(path) => publish(
-            phase,
-            &phase.save_status(&format!("Saved {}", path.display())),
-        ),
+        Ok(recording) => {
+            let message = recording.audio.map_or_else(
+                || format!("Saved {}", recording.video.display()),
+                |audio| {
+                    format!(
+                        "Saved {} and {}",
+                        recording.video.display(),
+                        audio.display()
+                    )
+                },
+            );
+            publish(phase, &phase.save_status(&message));
+        }
         Err(error) => publish(phase, &phase.save_status(&format!("Save failed: {error}"))),
     }
     drop(state);
@@ -582,19 +598,26 @@ fn self_test(path: &Path) -> Result<(), String> {
     if audio.is_empty() {
         return Err("Self-test produced no playback audio".into());
     }
-    export(&frames, &audio, path)?;
+    let recording = export(&frames, &audio, path)?;
     audio_buffer.clear();
     drop(audio_buffer);
     let file_size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if file_size < 1024 {
-        return Err("Export produced an unexpectedly small file".into());
+        return Err("Export produced an unexpectedly small video file".into());
+    }
+    let audio_path = recording.audio.ok_or("Export produced no audio file")?;
+    let audio_size = std::fs::metadata(&audio_path)
+        .map_err(|e| e.to_string())?
+        .len();
+    if audio_size < 1024 {
+        return Err("Export produced an unexpectedly small audio file".into());
     }
     buffer.clear();
     if buffer.len() != 0 || buffer.bytes() != 0 {
         return Err("Buffer did not clear".into());
     }
     drop(buffer);
-    println!("Media self-test passed: {} video frames, {} audio packets, {duration:.3}s, {bytes} buffered video bytes, {file_size} file bytes\n{}", frames.len(), audio.len(), path.display());
+    println!("Media self-test passed: {} video frames, {} audio packets, {duration:.3}s, {bytes} buffered video bytes, {file_size} video file bytes, {audio_size} audio file bytes\n{}\n{}", frames.len(), audio.len(), path.display(), audio_path.display());
     Ok(())
 }
 
@@ -662,7 +685,7 @@ pub fn run() {
                 "Ctrl+Alt+S",
                 "your Videos folder/Optic",
             );
-            println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video and playback audio to {folder}\n\n--self-test [path.mp4]  Verify synthetic video/audio encoding, buffering, and export without capturing your screen or playback device");
+            println!("Optic — {platform} screen replay\n\n{toggle}: start/stop buffering (stop clears history)\n{save}: save recent video (.mp4) and playback audio (.m4a) separately to {folder}\n\n--self-test [path.mp4]  Verify separate video/audio exports to path.mp4 and path.m4a without capturing your screen or playback device");
             #[cfg(target_os = "windows")]
             println!("--shutdown [seconds]  Finish any active save and close this session's Optic instance (default 120, maximum 600)");
         }
@@ -881,7 +904,13 @@ mod tests {
             save();
             assert!(recorder().saving);
             assert_eq!(recorder().phase, phase);
-            finish_save(Ok(PathBuf::from("recovery-clip.mp4")), 21);
+            finish_save(
+                Ok(SavedRecording {
+                    video: PathBuf::from("recovery-clip.mp4"),
+                    audio: None,
+                }),
+                21,
+            );
             let state = recorder();
             assert!(!state.saving);
             assert_eq!(state.phase, phase);
@@ -1004,7 +1033,13 @@ mod tests {
             handle_capture_event(9, 4, message);
             assert_eq!(recorder().phase, Phase::Stopped);
             handle_capture_event(9, 2, "");
-            finish_save(Ok(PathBuf::from("successful.mp4")), 9);
+            finish_save(
+                Ok(SavedRecording {
+                    video: PathBuf::from("successful.mp4"),
+                    audio: None,
+                }),
+                9,
+            );
         });
         assert!(!logs.0.exists());
     }

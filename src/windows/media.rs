@@ -1078,11 +1078,11 @@ impl FinalizeState {
         let mut result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if let Some(status) = *result {
-                return status.ok().operation("Finalizing the MP4");
+                return status.ok().operation("Finalizing the media file");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err("Finalizing the MP4 timed out.".into());
+                return Err("Finalizing the media file timed out.".into());
             }
             let (next, _) = self
                 .ready
@@ -1155,7 +1155,7 @@ impl ExportJob {
     fn check_cancel(&self) -> Result<(), String> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.cancelled || Instant::now() >= self.deadline {
-            Err("Writing the MP4 timed out.".into())
+            Err("Writing the media files timed out.".into())
         } else {
             Ok(())
         }
@@ -1169,11 +1169,67 @@ struct PartialFile {
 }
 
 impl PartialFile {
+    fn new(path: &[u16]) -> Result<Self, String> {
+        // SAFETY: The path is NUL-terminated and the caller owns the COM worker.
+        unsafe {
+            if GetFileAttributesW(PCWSTR(path.as_ptr())) != INVALID_FILE_ATTRIBUTES {
+                return Err("The output file already exists.".into());
+            }
+            let identifier = CoCreateGuid().operation("Naming the temporary media file")?;
+            let mut suffix = [0; 40];
+            let count = StringFromGUID2(&raw const identifier, &mut suffix);
+            if count <= 0 {
+                return Err("Unable to name the temporary media file.".into());
+            }
+            let length = usize::try_from(count - 1).map_err(|error| error.to_string())?;
+            let mut temporary_path = path[..path.len() - 1].to_vec();
+            temporary_path.extend(".optic-partial-".encode_utf16());
+            temporary_path.extend_from_slice(&suffix[..length]);
+            temporary_path.push(0);
+            let stream = MFCreateFile(
+                MF_ACCESSMODE_READWRITE,
+                MF_OPENMODE_FAIL_IF_EXIST,
+                MF_FILEFLAGS_NONE,
+                PCWSTR(temporary_path.as_ptr()),
+            )
+            .operation("Creating the media output")?;
+            Ok(Self {
+                path: temporary_path,
+                stream: Some(stream),
+                committed: false,
+            })
+        }
+    }
+
     fn close(&mut self) {
         if let Some(stream) = self.stream.take() {
             // SAFETY: The byte stream belongs to this worker and closing is idempotent.
             let _ = unsafe { stream.Close() };
         }
+    }
+
+    fn publish(&mut self, path: &[u16]) -> Result<(), String> {
+        // Allocate the rollback path before moving so even unwinding retains it.
+        let published_path = path.to_vec();
+        // SAFETY: Both paths are NUL-terminated. Omitting REPLACE_EXISTING ensures
+        // a target created after our initial existence check is never overwritten.
+        if let Err(error) = unsafe {
+            MoveFileExW(
+                PCWSTR(self.path.as_ptr()),
+                PCWSTR(path.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0)
+                || error.code() == HRESULT::from_win32(ERROR_FILE_EXISTS.0)
+            {
+                return Err("The output file already exists.".into());
+            }
+            return Err(error).operation("Publishing the media file");
+        }
+        // Until both outputs are committed, Drop also rolls back a published file.
+        self.path = published_path;
+        Ok(())
     }
 }
 
@@ -1365,171 +1421,224 @@ fn audio_type(aac: bool) -> Result<IMFMediaType, String> {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keeping the remux operation together makes COM and temporary-file drop order explicit"
-)]
+struct StagedOutput {
+    // Field order releases the writer before closing/deleting its partial file.
+    writer: Option<IMFSinkWriter>,
+    partial: PartialFile,
+    completion: Arc<FinalizeState>,
+    index: u32,
+}
+
+impl StagedOutput {
+    fn new(path: &[u16], output: &IMFMediaType, input: &IMFMediaType) -> Result<Self, String> {
+        let partial = PartialFile::new(path)?;
+        // SAFETY: Interfaces remain on the initialized export worker; the writer
+        // retains its callback, media types, settings and exclusively owned stream.
+        unsafe {
+            let mut attributes = None;
+            MFCreateAttributes(&raw mut attributes, 3)
+                .operation("Creating media writer settings")?;
+            let attributes = attributes.ok_or("The media writer settings were not created.")?;
+            attributes
+                .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)
+                .operation("Selecting the MPEG-4 container")?;
+            attributes
+                .SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)
+                .operation("Disabling media writer throttling")?;
+            let completion = Arc::new(FinalizeState::default());
+            let callback: IMFSinkWriterCallback = finalize_callback::FinalizeCallback {
+                state: Arc::clone(&completion),
+            }
+            .into();
+            attributes
+                .SetUnknown(&MF_SINK_WRITER_ASYNC_CALLBACK, &callback)
+                .operation("Setting media completion")?;
+            let writer =
+                MFCreateSinkWriterFromURL(PCWSTR::null(), partial.stream.as_ref(), &attributes)
+                    .operation("Creating the media writer")?;
+            let index = writer
+                .AddStream(output)
+                .operation("Adding the media stream")?;
+            writer
+                .SetInputMediaType(index, input, None)
+                .operation("Setting the media input")?;
+            writer.BeginWriting().operation("Starting media output")?;
+            Ok(Self {
+                writer: Some(writer),
+                partial,
+                completion,
+                index,
+            })
+        }
+    }
+
+    fn writer(&self) -> Result<&IMFSinkWriter, String> {
+        self.writer
+            .as_ref()
+            .ok_or_else(|| "The media writer has already finished.".into())
+    }
+
+    fn append(&self, sample: &IMFSample) -> Result<(), String> {
+        // SAFETY: The writer and sample belong to this export worker.
+        unsafe { self.writer()?.WriteSample(self.index, sample) }
+            .operation("Appending the media sample")
+    }
+
+    fn finish(&mut self, job: &ExportJob) -> Result<(), String> {
+        job.check_cancel()?;
+        // SAFETY: The worker owns both the stream and writer through finalization.
+        unsafe {
+            self.writer()?
+                .NotifyEndOfSegment(self.index)
+                .operation("Ending the media stream")?;
+            self.writer()?
+                .Finalize()
+                .operation("Starting media finalization")?;
+        }
+        self.completion.wait(job.deadline)?;
+        self.writer.take();
+        // Finalize may close this stream itself. Do not flush a closed stream.
+        self.partial.close();
+        Ok(())
+    }
+}
+
+fn stage_video(
+    samples: &[EncodedSample],
+    path: &[u16],
+    job: &ExportJob,
+) -> Result<StagedOutput, String> {
+    let first = samples.first().ok_or("No video frames supplied.")?;
+    let format = &first.format;
+    let media = video_type(format.width, format.height, &MFVideoFormat_H264)?;
+    // SAFETY: The media type copies the encoded stream's immutable header.
+    unsafe { media.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &format.sequence_header) }
+        .operation("Setting H.264 parameter sets")?;
+    // Equal compressed input/output types remux bytes without a transcoder.
+    let mut output = StagedOutput::new(path, &media, &media)?;
+    for encoded in samples {
+        job.check_cancel()?;
+        let rebased = encoded.pts - first.pts;
+        let sample = make_sample(&encoded.bytes, rebased, encoded.duration, encoded.keyframe)?;
+        // SAFETY: This initialized sample stays on the owning worker.
+        unsafe {
+            sample.SetUINT64(
+                &MFSampleExtension_DecodeTimestamp,
+                u64::try_from(rebased).map_err(|error| error.to_string())?,
+            )
+        }
+        .operation("Rebasing the decode timestamp")?;
+        output.append(&sample)?;
+    }
+    output.finish(job)?;
+    Ok(output)
+}
+
+fn append_pcm(output: &StagedOutput, bytes: &[u8], frames: i64) -> Result<i64, String> {
+    let count =
+        i64::try_from(bytes.len() / AUDIO_BLOCK_ALIGNMENT).map_err(|error| error.to_string())?;
+    let next = frames
+        .checked_add(count)
+        .ok_or("The audio timeline is too long.")?;
+    let pts = frames
+        .checked_mul(TICKS_PER_SECOND)
+        .ok_or("The audio timeline is too long.")?
+        / AUDIO_SAMPLE_RATE;
+    let end = next
+        .checked_mul(TICKS_PER_SECOND)
+        .ok_or("The audio timeline is too long.")?
+        / AUDIO_SAMPLE_RATE;
+    output.append(&make_sample(bytes, pts, end - pts, false)?)?;
+    Ok(next)
+}
+
+fn stage_audio(
+    audio: &[AudioSample],
+    path: &[u16],
+    job: &ExportJob,
+) -> Result<StagedOutput, String> {
+    let first = audio.first().ok_or("No audio packets supplied.")?;
+    let mut output = StagedOutput::new(path, &audio_type(true)?, &audio_type(false)?)?;
+    let mut frames = 0;
+    let silence = [0; 480 * AUDIO_BLOCK_ALIGNMENT];
+    for packet in audio {
+        job.check_cancel()?;
+        let target = i64::try_from(
+            (i128::from(packet.pts - first.pts) * i128::from(AUDIO_SAMPLE_RATE)
+                + i128::from(TICKS_PER_SECOND / 2))
+                / i128::from(TICKS_PER_SECOND),
+        )
+        .map_err(|error| error.to_string())?;
+        // AAC encoders can collapse timestamp discontinuities. Feed actual PCM
+        // silence so an interruption keeps its duration in the standalone file.
+        while frames < target {
+            job.check_cancel()?;
+            let gap =
+                usize::try_from((target - frames).min(480)).map_err(|error| error.to_string())?;
+            frames = append_pcm(&output, &silence[..gap * AUDIO_BLOCK_ALIGNMENT], frames)?;
+        }
+        // Capture clocks can overlap by a PCM frame after rounding. Avoid
+        // duplicating that interval when mapping packets onto the sample clock.
+        let overlap = usize::try_from(frames - target).map_err(|error| error.to_string())?;
+        let skipped = overlap.min(packet.bytes.len() / AUDIO_BLOCK_ALIGNMENT);
+        let bytes = &packet.bytes[skipped * AUDIO_BLOCK_ALIGNMENT..];
+        if !bytes.is_empty() {
+            frames = append_pcm(&output, bytes, frames)?;
+        }
+    }
+    output.finish(job)?;
+    Ok(output)
+}
+
 fn write_clip(
     samples: &[EncodedSample],
     audio: &[AudioSample],
     path: &[u16],
+    audio_path: Option<&[u16]>,
     job: &ExportJob,
 ) -> Result<(), String> {
     let _com = ComRuntime::new()?;
     let _runtime = MediaRuntime::new()?;
-    // SAFETY: All file paths are NUL-terminated and all COM objects are created,
-    // used, and dropped on this initialized MTA export worker.
-    unsafe {
-        if GetFileAttributesW(PCWSTR(path.as_ptr())) != INVALID_FILE_ATTRIBUTES {
-            return Err("The output file already exists.".into());
-        }
-        let identifier = CoCreateGuid().operation("Naming the temporary MP4")?;
-        let mut suffix = [0; 40];
-        let suffix_length = StringFromGUID2(&raw const identifier, &mut suffix);
-        if suffix_length <= 0 {
-            return Err("Unable to name the temporary MP4.".into());
-        }
-        let suffix_length =
-            usize::try_from(suffix_length - 1).map_err(|error| error.to_string())?;
-        let mut temporary_path = path[..path.len() - 1].to_vec();
-        temporary_path.extend(".optic-partial-".encode_utf16());
-        temporary_path.extend_from_slice(&suffix[..suffix_length]);
-        temporary_path.push(0);
-        let stream = MFCreateFile(
-            MF_ACCESSMODE_READWRITE,
-            MF_OPENMODE_FAIL_IF_EXIST,
-            MF_FILEFLAGS_NONE,
-            PCWSTR(temporary_path.as_ptr()),
-        )
-        .operation("Creating the MP4 output")?;
-        let mut partial = PartialFile {
-            path: temporary_path,
-            stream: Some(stream),
-            committed: false,
-        };
-        let mut attributes = None;
-        MFCreateAttributes(&raw mut attributes, 3).operation("Creating MP4 writer settings")?;
-        let attributes = attributes.ok_or("The MP4 writer settings were not created.")?;
-        attributes
-            .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)
-            .operation("Selecting the MP4 container")?;
-        attributes
-            .SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)
-            .operation("Disabling MP4 writer throttling")?;
-        let completion = Arc::new(FinalizeState::default());
-        let callback: IMFSinkWriterCallback = finalize_callback::FinalizeCallback {
-            state: Arc::clone(&completion),
-        }
-        .into();
-        attributes
-            .SetUnknown(&MF_SINK_WRITER_ASYNC_CALLBACK, &callback)
-            .operation("Setting MP4 completion")?;
-        let writer =
-            MFCreateSinkWriterFromURL(PCWSTR::null(), partial.stream.as_ref(), &attributes)
-                .operation("Creating the MP4 writer")?;
-        let first = samples.first().ok_or("No video frames supplied.")?;
-        let format = &first.format;
-        let media = video_type(format.width, format.height, &MFVideoFormat_H264)?;
-        media
-            .SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &format.sequence_header)
-            .operation("Setting H.264 parameter sets")?;
-        let index = writer
-            .AddStream(&media)
-            .operation("Adding the MP4 video stream")?;
-        // Equal compressed input/output types remux bytes without a transcoder.
-        writer
-            .SetInputMediaType(index, &media, None)
-            .operation("Setting compressed MP4 input")?;
-        let audio_index = if audio.is_empty() {
-            None
-        } else {
-            let index = writer
-                .AddStream(&audio_type(true)?)
-                .operation("Adding the MP4 AAC stream")?;
-            writer
-                .SetInputMediaType(index, &audio_type(false)?, None)
-                .operation("Setting PCM input for AAC encoding")?;
-            Some(index)
-        };
-        writer.BeginWriting().operation("Starting MP4 output")?;
-        let offset = first.pts;
-        let mut video = samples.iter().peekable();
-        let mut sound = audio.iter().peekable();
-        let mut audio_end = None;
-        // Interleave by presentation time so the MP4 writer never has to hold
-        // the entire video while it waits for its corresponding audio input.
-        while video.peek().is_some() || sound.peek().is_some() {
-            job.check_cancel()?;
-            if sound
-                .peek()
-                .is_some_and(|packet| video.peek().is_none_or(|frame| packet.pts <= frame.pts))
-            {
-                let packet = sound.next().ok_or("An audio packet is missing.")?;
-                let sample =
-                    make_sample(&packet.bytes, packet.pts - offset, packet.duration, false)?;
-                if audio_end.is_none_or(|end: i64| packet.pts.abs_diff(end) > 1) {
-                    sample
-                        .SetUINT32(&MFSampleExtension_Discontinuity, 1)
-                        .operation("Marking an audio discontinuity")?;
-                }
-                writer
-                    .WriteSample(audio_index.ok_or("The AAC stream is missing.")?, &sample)
-                    .operation("Encoding and appending MP4 audio")?;
-                audio_end = Some(packet.pts + packet.duration);
-            } else {
-                let encoded = video.next().ok_or("A video frame is missing.")?;
-                let rebased = encoded.pts - offset;
-                let sample =
-                    make_sample(&encoded.bytes, rebased, encoded.duration, encoded.keyframe)?;
-                sample
-                    .SetUINT64(
-                        &MFSampleExtension_DecodeTimestamp,
-                        u64::try_from(rebased).map_err(|error| error.to_string())?,
-                    )
-                    .operation("Rebasing the decode timestamp")?;
-                writer
-                    .WriteSample(index, &sample)
-                    .operation("Appending MP4 video")?;
-            }
-        }
-        job.check_cancel()?;
-        writer
-            .NotifyEndOfSegment(index)
-            .operation("Ending MP4 video")?;
-        if let Some(index) = audio_index {
-            writer
-                .NotifyEndOfSegment(index)
-                .operation("Ending MP4 audio")?;
-        }
-        writer.Finalize().operation("Starting MP4 finalization")?;
-        completion.wait(job.deadline)?;
-        drop(writer);
-        // Finalize may close this stream itself. Do not flush a closed stream.
-        partial.close();
-        // Cancellation and publication share one mutex. Once the caller reports
-        // timeout, this job can never subsequently publish a successful output.
-        let mut state = job.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.cancelled || Instant::now() >= job.deadline {
-            return Err("Writing the MP4 timed out.".into());
-        }
-        if let Err(error) = MoveFileExW(
-            PCWSTR(partial.path.as_ptr()),
-            PCWSTR(path.as_ptr()),
-            MOVEFILE_WRITE_THROUGH,
-        ) {
-            if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0)
-                || error.code() == HRESULT::from_win32(ERROR_FILE_EXISTS.0)
-            {
-                return Err("The output file already exists.".into());
-            }
-            return Err(error).operation("Publishing the MP4");
-        }
-        partial.committed = true;
-        state.success = true;
-        state.done = true;
-        drop(state);
-        job.ready.notify_all();
+    let video = stage_video(samples, path, job)?;
+    let sound = audio_path
+        .map(|path| stage_audio(audio, path, job))
+        .transpose()?;
+    publish_outputs(video, sound, path, audio_path, job)
+}
+
+fn publish_outputs(
+    mut video: StagedOutput,
+    mut sound: Option<StagedOutput>,
+    path: &[u16],
+    audio_path: Option<&[u16]>,
+    job: &ExportJob,
+) -> Result<(), String> {
+    // Both files are finalized before publishing either. Cancellation and
+    // publication share one mutex: a timed-out caller cannot get a later save.
+    let mut state = job.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if state.cancelled || Instant::now() >= job.deadline {
+        return Err("Writing the media files timed out.".into());
     }
+    video.partial.publish(path)?;
+    if let Some(output) = &mut sound {
+        if Instant::now() >= job.deadline {
+            return Err("Writing the media files timed out.".into());
+        }
+        output
+            .partial
+            .publish(audio_path.ok_or("The audio output path is missing.")?)?;
+    }
+    if Instant::now() >= job.deadline {
+        return Err("Writing the media files timed out.".into());
+    }
+    if let Some(output) = &mut sound {
+        output.partial.committed = true;
+    }
+    video.partial.committed = true;
+    state.success = true;
+    state.done = true;
+    drop(state);
+    job.ready.notify_all();
     Ok(())
 }
 
@@ -1551,6 +1660,17 @@ pub fn export_samples_with_audio(
         .checked_add(last.duration)
         .ok_or("The video timeline is too long.")?;
     let audio = trim_audio(audio, first.pts, end)?;
+    let audio_path = if audio.is_empty() {
+        None
+    } else {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("m4a"))
+        {
+            return Err("Video and audio output paths must be different.".into());
+        }
+        Some(file_path(&path.with_extension("m4a"))?)
+    };
     let path = file_path(path)?;
     let job = Arc::new(ExportJob::new(Instant::now() + Duration::from_secs(60)));
     let worker_job = Arc::clone(&job);
@@ -1561,9 +1681,9 @@ pub fn export_samples_with_audio(
             .name("optic-export".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    write_clip(&samples, &audio, &path, &worker_job)
+                    write_clip(&samples, &audio, &path, audio_path.as_deref(), &worker_job)
                 }))
-                .unwrap_or_else(|_| Err("The MP4 writer failed unexpectedly.".into()));
+                .unwrap_or_else(|_| Err("The media writer failed unexpectedly.".into()));
                 if let Err(error) = result {
                     let mut state = worker_job
                         .state
@@ -1589,7 +1709,7 @@ pub fn export_samples_with_audio(
         let remaining = job.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             state.cancelled = true;
-            return Err("Writing the MP4 timed out.".into());
+            return Err("Writing the media files timed out.".into());
         }
         let (next, _) = job
             .ready
@@ -1673,6 +1793,12 @@ fn verify_decoding(
         .operation("Opening exported MP4 bytes")?;
         let reader =
             MFCreateSourceReaderFromByteStream(&stream, None).operation("Opening exported MP4")?;
+        if reader
+            .GetNativeMediaType(sdk_uint(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0), 0)
+            .is_ok()
+        {
+            return Err("The video MP4 must not contain an audio stream.".into());
+        }
         reader
             .SetStreamSelection(all, false)
             .operation("Deselecting streams")?;
@@ -1906,11 +2032,44 @@ mod tests {
             .collect()
     }
 
+    fn synthetic_video() -> Result<Vec<EncodedSample>, String> {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&received);
+        generate_test_video(
+            8,
+            Arc::new(move |_, sample| {
+                output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(sample);
+            }),
+        )?;
+        let samples = received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Ok(samples)
+    }
+
+    fn assert_no_partials(directory: &Path) -> Result<(), String> {
+        for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".optic-partial-"),
+                "Failed export left a temporary file"
+            );
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
-        reason = "The bounded integration verifier checks codec, decoded PCM, tone and clip timing together"
+        reason = "The bounded integration verifier checks codec, decoded PCM and audio timing together"
     )]
-    fn verify_audio_tone(path: &Path, expected_duration: i64) -> Result<(), String> {
+    fn decode_audio(path: &Path, expected_duration: i64) -> Result<Vec<i16>, String> {
         let _com = ComRuntime::new()?;
         let _runtime = MediaRuntime::new()?;
         let path = file_path(path)?;
@@ -1927,6 +2086,12 @@ mod tests {
             .operation("Opening the audio test clip")?;
             let reader = MFCreateSourceReaderFromByteStream(&stream, None)
                 .operation("Opening the audio test decoder")?;
+            assert!(
+                reader
+                    .GetNativeMediaType(sdk_uint(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0), 0)
+                    .is_err(),
+                "The audio M4A must not contain a video stream"
+            );
             reader
                 .SetStreamSelection(sdk_uint(MF_SOURCE_READER_ALL_STREAMS.0), false)
                 .operation("Deselecting the audio test streams")?;
@@ -1983,7 +2148,7 @@ mod tests {
                 if let Some(sample) = sample {
                     assert!(pts > previous, "Decoded audio timestamps must increase");
                     if previous < 0 {
-                        assert!(pts.abs() <= 1, "Audio must share the rebased video origin");
+                        assert!(pts.abs() <= 1, "Standalone audio must start at zero");
                     }
                     previous = pts;
                     last_end = pts
@@ -2015,70 +2180,220 @@ mod tests {
             // AAC uses 1024-frame blocks and can expose encoder priming/padding.
             assert!(
                 last_end.abs_diff(expected_duration) < 450_000,
-                "AAC timing must stay within two codec blocks of video"
+                "AAC timing must stay within two codec blocks of the retained audio"
             );
-            assert!(
-                decoded.len() > 48_000,
-                "AAC must fully decode the retained tone"
-            );
-            let mean_amplitude = decoded
-                .iter()
-                .map(|value| i64::from(*value).abs())
-                .sum::<i64>()
-                / i64::try_from(decoded.len()).map_err(|error| error.to_string())?;
-            assert!(
-                mean_amplitude > 1000,
-                "The AAC track must contain the captured tone"
-            );
-            let tone = decoded
-                .get(2048..12_048)
-                .ok_or("The decoded tone is too short.")?;
-            let crossings = tone
-                .windows(2)
-                .filter(|pair| pair[0] <= 0 && pair[1] > 0)
-                .count();
-            let frequency = u64::try_from(crossings).map_err(|error| error.to_string())? * 48_000
-                / u64::try_from(tone.len()).map_err(|error| error.to_string())?;
-            assert!(
-                (425..=450).contains(&frequency),
-                "The decoded tone must preserve its 440 Hz frequency"
-            );
+            Ok(decoded)
         }
-        Ok(())
+    }
+
+    fn mean_amplitude(samples: &[i16]) -> Result<i64, String> {
+        if samples.is_empty() {
+            return Err("The decoded PCM interval is empty.".into());
+        }
+        Ok(samples
+            .iter()
+            .map(|value| i64::from(*value).abs())
+            .sum::<i64>()
+            / i64::try_from(samples.len()).map_err(|error| error.to_string())?)
+    }
+
+    fn verify_audio_tone(path: &Path, expected_duration: i64) -> Result<Vec<i16>, String> {
+        let decoded = decode_audio(path, expected_duration)?;
+        assert!(
+            decoded.len() > 48_000,
+            "AAC must fully decode the retained tone"
+        );
+        assert!(
+            mean_amplitude(&decoded)? > 1000,
+            "The AAC file must contain the captured tone"
+        );
+        let tone = decoded
+            .get(2048..12_048)
+            .ok_or("The decoded tone is too short.")?;
+        let crossings = tone
+            .windows(2)
+            .filter(|pair| pair[0] <= 0 && pair[1] > 0)
+            .count();
+        let frequency = u64::try_from(crossings).map_err(|error| error.to_string())? * 48_000
+            / u64::try_from(tone.len()).map_err(|error| error.to_string())?;
+        assert!(
+            (425..=450).contains(&frequency),
+            "The decoded tone must preserve its 440 Hz frequency"
+        );
+        Ok(decoded)
     }
 
     #[test]
-    fn sixty_fps_video_and_trimmed_aac_tone_fully_decode() -> Result<(), String> {
+    fn separate_video_and_trimmed_aac_preserve_tone_gaps_and_silence() -> Result<(), String> {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let directory = TestDirectory::new()?;
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&received);
-        generate_test_video(
-            8,
-            Arc::new(move |_, sample| {
-                output
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(sample);
-            }),
-        )?;
-        let samples = received
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let samples = synthetic_video()?;
         assert_eq!(samples.len(), 180);
         assert!(samples[60].keyframe);
         let video = &samples[60..];
-        let clip = directory.0.join("sixty-fps-with-audio.mp4");
+        let clip = directory.0.join("Replay-视频-é.mp4");
         export_samples_with_audio(video, &tone_packets(), &clip)?;
         verify_clip(&clip, 120)?;
-        verify_audio_tone(&clip, 2 * TICKS_PER_SECOND)?;
+        verify_audio_tone(&clip.with_extension("m4a"), 2 * TICKS_PER_SECOND)?;
         let mut audio = tone_packets();
         audio.retain(|packet| !(15_000_000..17_000_000).contains(&packet.pts));
         let gap_clip = directory.0.join("sixty-fps-with-audio-gap.mp4");
         export_samples_with_audio(video, &audio, &gap_clip)?;
         verify_clip(&gap_clip, 120)?;
-        verify_audio_tone(&gap_clip, 2 * TICKS_PER_SECOND)?;
+        let decoded = verify_audio_tone(&gap_clip.with_extension("m4a"), 2 * TICKS_PER_SECOND)?;
+        assert!(
+            mean_amplitude(
+                decoded
+                    .get(27_000..30_500)
+                    .ok_or("The audio gap is missing.")?
+            )? < 100,
+            "The captured audio gap must decode as silence at its original position"
+        );
+        assert!(
+            mean_amplitude(
+                decoded
+                    .get(38_000..43_000)
+                    .ok_or("Audio after the gap is missing.")?
+            )? > 1000,
+            "The tone must resume after the audio gap"
+        );
+        let mut late_audio = tone_packets();
+        late_audio.retain(|packet| packet.pts >= 12_500_000);
+        let late_clip = directory.0.join("late-audio.mp4");
+        export_samples_with_audio(video, &late_audio, &late_clip)?;
+        verify_clip(&late_clip, 120)?;
+        verify_audio_tone(&late_clip.with_extension("m4a"), 17_500_000)?;
+        let mut silent_audio = tone_packets();
+        for packet in &mut silent_audio {
+            packet.bytes = vec![0; packet.bytes.len()].into();
+        }
+        let silent_clip = directory.0.join("silence.mp4");
+        export_samples_with_audio(video, &silent_audio, &silent_clip)?;
+        verify_clip(&silent_clip, 120)?;
+        let silence = decode_audio(&silent_clip.with_extension("m4a"), 2 * TICKS_PER_SECOND)?;
+        assert!(
+            silence.len() >= 95_000,
+            "Silent capture must retain its duration"
+        );
+        assert!(
+            mean_amplitude(&silence)? < 5,
+            "Silent capture must remain silent"
+        );
+        assert_no_partials(&directory.0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn video_only_exports_omit_audio_and_preserve_existing_companions() -> Result<(), String> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let directory = TestDirectory::new()?;
+        let samples = synthetic_video()?;
+        let video = &samples[60..];
+        let clip = directory.0.join("video-only.mp4");
+        export_samples_with_audio(video, &[], &clip)?;
+        verify_clip(&clip, 120)?;
+        assert!(!clip.with_extension("m4a").exists());
+        let outside = directory.0.join("audio-outside-clip.mp4");
+        export_samples_with_audio(video, &tone_packets()[..50], &outside)?;
+        verify_clip(&outside, 120)?;
+        assert!(!outside.with_extension("m4a").exists());
+        let existing = directory.0.join("existing-companion.mp4");
+        let companion = existing.with_extension("m4a");
+        std::fs::write(&companion, b"existing audio").map_err(|error| error.to_string())?;
+        export_samples_with_audio(video, &[], &existing)?;
+        verify_clip(&existing, 120)?;
+        assert_eq!(
+            std::fs::read(&companion).map_err(|error| error.to_string())?,
+            b"existing audio"
+        );
+        assert_no_partials(&directory.0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn separate_exports_reject_existing_targets_and_path_collisions() -> Result<(), String> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let directory = TestDirectory::new()?;
+        let samples = synthetic_video()?;
+        let video = &samples[60..];
+        let audio = tone_packets();
+        let clip = directory.0.join("existing-audio.mp4");
+        let companion = clip.with_extension("m4a");
+        std::fs::write(&companion, b"existing audio").map_err(|error| error.to_string())?;
+        assert!(export_samples_with_audio(video, &audio, &clip).is_err());
+        assert!(
+            !clip.exists(),
+            "Audio failure must not publish the staged video"
+        );
+        assert_eq!(
+            std::fs::read(&companion).map_err(|error| error.to_string())?,
+            b"existing audio"
+        );
+        let existing_video = directory.0.join("existing-video.mp4");
+        std::fs::write(&existing_video, b"existing video").map_err(|error| error.to_string())?;
+        assert!(export_samples_with_audio(video, &audio, &existing_video).is_err());
+        assert_eq!(
+            std::fs::read(&existing_video).map_err(|error| error.to_string())?,
+            b"existing video"
+        );
+        assert!(!existing_video.with_extension("m4a").exists());
+        for name in ["collision.m4a", "collision.M4A"] {
+            let collision = directory.0.join(name);
+            assert!(export_samples_with_audio(video, &audio, &collision).is_err());
+            assert!(!collision.exists());
+        }
+        let invalid = directory.0.join("invalid-audio.mp4");
+        let mut bad_audio = audio;
+        bad_audio[100].bytes = vec![0; 3].into();
+        assert!(export_samples_with_audio(video, &bad_audio, &invalid).is_err());
+        assert!(!invalid.exists());
+        assert!(!invalid.with_extension("m4a").exists());
+        assert_no_partials(&directory.0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn second_publication_failure_and_cancellation_clean_both_outputs() -> Result<(), String> {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let directory = TestDirectory::new()?;
+        let samples = synthetic_video()?;
+        let audio = trim_audio(&tone_packets(), samples[60].pts, 3 * TICKS_PER_SECOND)?;
+        let _com = ComRuntime::new()?;
+        let _runtime = MediaRuntime::new()?;
+        for cancel in [false, true] {
+            let clip = directory
+                .0
+                .join(if cancel { "cancel.mp4" } else { "race.mp4" });
+            let companion = clip.with_extension("m4a");
+            let path = file_path(&clip)?;
+            let audio_path = file_path(&companion)?;
+            let job = ExportJob::new(Instant::now() + Duration::from_secs(60));
+            let video = stage_video(&samples[60..], &path, &job)?;
+            let sound = stage_audio(&audio, &audio_path, &job)?;
+            if cancel {
+                job.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .cancelled = true;
+            } else {
+                // Model a target created after staging but before the second move.
+                std::fs::write(&companion, b"racing audio").map_err(|error| error.to_string())?;
+            }
+            assert!(publish_outputs(video, Some(sound), &path, Some(&audio_path), &job).is_err());
+            assert!(
+                !clip.exists(),
+                "Failed pair publication must roll back video"
+            );
+            if cancel {
+                assert!(!companion.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(&companion).map_err(|error| error.to_string())?,
+                    b"racing audio"
+                );
+            }
+            assert_no_partials(&directory.0)?;
+        }
         Ok(())
     }
 
@@ -2188,6 +2503,31 @@ mod tests {
     fn verify_external_clip() -> Result<(), String> {
         let path =
             std::env::var_os("OPTIC_VERIFY_CLIP").ok_or("OPTIC_VERIFY_CLIP was not supplied")?;
-        verify_clip(Path::new(&path), 120)
+        let path = Path::new(&path);
+        verify_clip(path, 120)?;
+        let decoded = decode_audio(&path.with_extension("m4a"), 2 * TICKS_PER_SECOND)?;
+        assert!(
+            decoded.len() >= 95_000,
+            "Self-test audio must retain two seconds"
+        );
+        // The app generates one second of tone, silence, then tone. Its replay
+        // snapshot keeps the final two seconds, including the silent first half.
+        assert!(
+            mean_amplitude(
+                decoded
+                    .get(10_000..30_000)
+                    .ok_or("Self-test silence is missing.")?
+            )? < 100,
+            "The self-test audio must preserve its first second of silence"
+        );
+        assert!(
+            mean_amplitude(
+                decoded
+                    .get(60_000..85_000)
+                    .ok_or("Self-test tone is missing.")?
+            )? > 1000,
+            "The self-test audio must preserve its second second of tone"
+        );
+        Ok(())
     }
 }

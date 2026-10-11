@@ -226,7 +226,7 @@ try {
             Invoke-CiCommand -Name 'windows-media-self-test' -Phase 'Check' -FilePath $cargo `
                 -Arguments @('run', '--locked', '--all-features', '--', '--self-test', (Join-Path $reportDirectory 'self-test.mp4'))
             # Pixel, tray lifecycle, and media integration coverage now runs in
-            # cargo test above. Decode the executable's replay-buffer export too.
+            # cargo test above. Decode both files from its replay-buffer export too.
             $env:OPTIC_VERIFY_CLIP = Join-Path $reportDirectory 'self-test.mp4'
             Invoke-CiCommand -Name 'windows-self-test-decode' -Phase 'Check' -FilePath $cargo -Arguments @('test', '--locked', '--all-features', 'windows::media::tests::verify_external_clip', '--', '--ignored', '--exact', '--nocapture')
 

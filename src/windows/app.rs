@@ -413,7 +413,7 @@ pub fn play_save_sound() {
         return;
     }
     // SAFETY: MessageBeep takes only a sound identifier and queues playback
-    // asynchronously. Feedback is best effort; the MP4 is already finalized.
+    // asynchronously. Feedback is best effort; the recording files are finalized.
     unsafe {
         let _ = MessageBeep(MB_OK);
     }
