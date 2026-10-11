@@ -10,7 +10,9 @@ pub use crate::windows::media::AudioSample;
 pub use crate::windows::media::EncodedSample as Sample;
 #[cfg(target_os = "windows")]
 pub use crate::windows::{
-    app::{finish_quit, prepare_console, recordings_folder, run, set_status, shutdown},
+    app::{
+        finish_quit, play_save_sound, prepare_console, recordings_folder, run, set_status, shutdown,
+    },
     capture::stop as capture_stop,
     FrameCallback,
 };
@@ -95,6 +97,7 @@ mod macos {
         fn optic_set_error_callback(callback: ErrorCallback);
         fn optic_run(callback: extern "C" fn(i32) -> bool);
         fn optic_finish_quit();
+        fn optic_play_save_sound();
         fn optic_set_status(state: i32, message: *const c_char);
         fn optic_capture_start(
             generation: u64,
@@ -188,6 +191,15 @@ mod macos {
     pub fn finish_quit() {
         // SAFETY: Swift queues termination on the main loop and retains no references.
         unsafe { optic_finish_quit() };
+    }
+
+    pub fn play_save_sound() {
+        // Synthetic save tests should not play sounds on the user's desktop.
+        if cfg!(test) {
+            return;
+        }
+        // SAFETY: Swift queues playback on the main loop and borrows no Rust data.
+        unsafe { optic_play_save_sound() };
     }
 
     pub fn set_status(state: i32, message: &str) {

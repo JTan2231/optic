@@ -442,12 +442,17 @@ fn finish_save(result: Result<PathBuf, String>, generation: u64) {
         native::finish_quit();
         return;
     }
+    let saved = result.is_ok();
     match result {
         Ok(path) => publish(
             phase,
             &phase.save_status(&format!("Saved {}", path.display())),
         ),
         Err(error) => publish(phase, &phase.save_status(&format!("Save failed: {error}"))),
+    }
+    drop(state);
+    if saved {
+        native::play_save_sound();
     }
 }
 

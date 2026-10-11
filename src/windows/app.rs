@@ -51,7 +51,7 @@ use windows::{
                 ATTACH_PARENT_PROCESS, CONSOLE_MODE, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
                 STD_OUTPUT_HANDLE,
             },
-            Diagnostics::Debug::OutputDebugStringW,
+            Diagnostics::Debug::{MessageBeep, OutputDebugStringW},
             LibraryLoader::{GetModuleHandleW, GetProcAddress},
             Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
             RemoteDesktop::{
@@ -403,6 +403,19 @@ pub fn set_status(state: i32, message: &str) {
         // SAFETY: A failed post did not transfer this Box to another thread.
         unsafe { drop(Box::from_raw(payload)) };
         queue_status_failure(window, error);
+    }
+}
+
+/// Queues a short system sound after a successful save without blocking playback.
+pub fn play_save_sound() {
+    // Synthetic save tests should not play sounds on the user's desktop.
+    if cfg!(test) {
+        return;
+    }
+    // SAFETY: MessageBeep takes only a sound identifier and queues playback
+    // asynchronously. Feedback is best effort; the MP4 is already finalized.
+    unsafe {
+        let _ = MessageBeep(MB_OK);
     }
 }
 

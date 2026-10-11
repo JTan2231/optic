@@ -103,6 +103,10 @@ starting, the clip contains the history available so far. Stopping does not
 cancel a save that you already requested, and starting again creates fresh
 history.
 
+A short completion sound plays after a clip has finished writing successfully:
+the system default beep on Windows, and a quiet Glass chime on macOS. Failed
+saves and saves completed while quitting stay silent.
+
 On Windows, brief capture interruptions such as Alt-Tab out of a fullscreen app
 recover automatically. Optic repeats the last good image for up to five seconds
 while rebuilding capture, so a saved clip may briefly freeze before motion resumes.

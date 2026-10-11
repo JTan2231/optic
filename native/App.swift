@@ -3,6 +3,7 @@
 // for 1/2; for 3, false defers termination until optic_finish_quit() is called.
 // optic_set_status(state, message) copies message before asynchronously updating
 // UI: 0 stopped, 1 starting, 2 buffering, 3 stopping. Callbacks run on main.
+// optic_play_save_sound() schedules a brief completion chime on main.
 
 import AppKit
 import Carbon
@@ -77,6 +78,18 @@ public func opticFinishQuit() {
         opticApplicationDelegate?.finishQuit()
     }
     CFRunLoopWakeUp(CFRunLoopGetMain())
+}
+
+@_cdecl("optic_play_save_sound")
+public func opticPlaySaveSound() {
+    DispatchQueue.main.async {
+        guard let sound = NSSound(named: NSSound.Name("Glass")) else {
+            NSSound.beep()
+            return
+        }
+        sound.volume = 0.5
+        _ = sound.play()
+    }
 }
 
 private final class OpticApplicationDelegate: NSObject, NSApplicationDelegate {
